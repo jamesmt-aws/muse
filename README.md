@@ -14,6 +14,7 @@ go install github.com/ellistarn/muse/cmd/muse@latest
 
 ```bash
 muse distill                # discover conversations and distill muse.md
+muse tell "preference"    # tell your muse something directly
 muse ask "your question"  # ask your muse directly
 muse listen               # start MCP server
 muse show                 # print muse.md
