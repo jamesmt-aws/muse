@@ -2,6 +2,8 @@ package storage_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,53 +16,53 @@ func newTestLocalStore(t *testing.T) *storage.LocalStore {
 	return storage.NewLocalStoreWithRoot(t.TempDir())
 }
 
-func TestLocalStore_SessionRoundTrip(t *testing.T) {
+func TestLocalStore_ConversationRoundTrip(t *testing.T) {
 	store := newTestLocalStore(t)
 	ctx := context.Background()
 
-	session := &conversation.Session{
-		SchemaVersion: 1,
-		Source:        "opencode",
-		SessionID:     "sess-001",
-		Project:       "/home/user/project",
-		Title:         "Fix bug in parser",
-		CreatedAt:     time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC),
-		UpdatedAt:     time.Date(2025, 1, 1, 11, 0, 0, 0, time.UTC),
+	conv := &conversation.Conversation{
+		SchemaVersion:  1,
+		Source:         "opencode",
+		ConversationID: "conv-001",
+		Project:        "/home/user/project",
+		Title:          "Fix bug in parser",
+		CreatedAt:      time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC),
+		UpdatedAt:      time.Date(2025, 1, 1, 11, 0, 0, 0, time.UTC),
 		Messages: []conversation.Message{
 			{Role: "user", Content: "Fix the parser", Timestamp: time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)},
 			{Role: "assistant", Content: "Done.", Timestamp: time.Date(2025, 1, 1, 10, 1, 0, 0, time.UTC), Model: "claude-3"},
 		},
 	}
 
-	n, err := store.PutSession(ctx, session)
+	n, err := store.PutConversation(ctx, conv)
 	if err != nil {
-		t.Fatalf("PutSession: %v", err)
+		t.Fatalf("PutConversation: %v", err)
 	}
 	if n == 0 {
-		t.Fatal("PutSession returned 0 bytes")
+		t.Fatal("PutConversation returned 0 bytes")
 	}
 
-	got, err := store.GetSession(ctx, "opencode", "sess-001")
+	got, err := store.GetConversation(ctx, "opencode", "conv-001")
 	if err != nil {
-		t.Fatalf("GetSession: %v", err)
+		t.Fatalf("GetConversation: %v", err)
 	}
-	if got.SessionID != session.SessionID {
-		t.Errorf("SessionID = %q, want %q", got.SessionID, session.SessionID)
+	if got.ConversationID != conv.ConversationID {
+		t.Errorf("ConversationID = %q, want %q", got.ConversationID, conv.ConversationID)
 	}
-	if got.Source != session.Source {
-		t.Errorf("Source = %q, want %q", got.Source, session.Source)
+	if got.Source != conv.Source {
+		t.Errorf("Source = %q, want %q", got.Source, conv.Source)
 	}
-	if got.Title != session.Title {
-		t.Errorf("Title = %q, want %q", got.Title, session.Title)
+	if got.Title != conv.Title {
+		t.Errorf("Title = %q, want %q", got.Title, conv.Title)
 	}
-	if got.Project != session.Project {
-		t.Errorf("Project = %q, want %q", got.Project, session.Project)
+	if got.Project != conv.Project {
+		t.Errorf("Project = %q, want %q", got.Project, conv.Project)
 	}
-	if !got.CreatedAt.Equal(session.CreatedAt) {
-		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, session.CreatedAt)
+	if !got.CreatedAt.Equal(conv.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, conv.CreatedAt)
 	}
-	if !got.UpdatedAt.Equal(session.UpdatedAt) {
-		t.Errorf("UpdatedAt = %v, want %v", got.UpdatedAt, session.UpdatedAt)
+	if !got.UpdatedAt.Equal(conv.UpdatedAt) {
+		t.Errorf("UpdatedAt = %v, want %v", got.UpdatedAt, conv.UpdatedAt)
 	}
 	if len(got.Messages) != 2 {
 		t.Fatalf("len(Messages) = %d, want 2", len(got.Messages))
@@ -72,9 +74,9 @@ func TestLocalStore_SessionRoundTrip(t *testing.T) {
 		t.Errorf("Messages[1].Model = %q, want %q", got.Messages[1].Model, "claude-3")
 	}
 
-	entries, err := store.ListSessions(ctx)
+	entries, err := store.ListConversations(ctx)
 	if err != nil {
-		t.Fatalf("ListSessions: %v", err)
+		t.Fatalf("ListConversations: %v", err)
 	}
 	if len(entries) != 1 {
 		t.Fatalf("len(entries) = %d, want 1", len(entries))
@@ -82,19 +84,19 @@ func TestLocalStore_SessionRoundTrip(t *testing.T) {
 	if entries[0].Source != "opencode" {
 		t.Errorf("entry.Source = %q, want %q", entries[0].Source, "opencode")
 	}
-	if entries[0].SessionID != "sess-001" {
-		t.Errorf("entry.SessionID = %q, want %q", entries[0].SessionID, "sess-001")
+	if entries[0].ConversationID != "conv-001" {
+		t.Errorf("entry.ConversationID = %q, want %q", entries[0].ConversationID, "conv-001")
 	}
-	if entries[0].Key != "conversations/opencode/sess-001.json" {
-		t.Errorf("entry.Key = %q, want %q", entries[0].Key, "conversations/opencode/sess-001.json")
+	if entries[0].Key != "conversations/opencode/conv-001.json" {
+		t.Errorf("entry.Key = %q, want %q", entries[0].Key, "conversations/opencode/conv-001.json")
 	}
 }
 
-func TestLocalStore_SessionNotFound(t *testing.T) {
+func TestLocalStore_ConversationNotFound(t *testing.T) {
 	store := newTestLocalStore(t)
 	ctx := context.Background()
 
-	_, err := store.GetSession(ctx, "opencode", "nonexistent")
+	_, err := store.GetConversation(ctx, "opencode", "nonexistent")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -227,7 +229,7 @@ func TestLocalStore_ObservationRoundTrip(t *testing.T) {
 	store := newTestLocalStore(t)
 	ctx := context.Background()
 
-	memoryKey := "conversations/opencode/sess-1.json"
+	memoryKey := "conversations/opencode/conv-1.json"
 	content := "## Observations\n- User prefers concise code."
 
 	if err := store.PutObservation(ctx, memoryKey, content); err != nil {
@@ -276,9 +278,9 @@ func TestLocalStore_DeletePrefix(t *testing.T) {
 	ctx := context.Background()
 
 	keys := []string{
-		"conversations/opencode/sess-1.json",
-		"conversations/opencode/sess-2.json",
-		"conversations/claude/sess-3.json",
+		"conversations/opencode/conv-1.json",
+		"conversations/opencode/conv-2.json",
+		"conversations/claude/conv-3.json",
 	}
 	for _, key := range keys {
 		if err := store.PutObservation(ctx, key, "observation for "+key); err != nil {
@@ -309,15 +311,42 @@ func TestLocalStore_DeletePrefix(t *testing.T) {
 	}
 }
 
-func TestLocalStore_ListSessionsEmpty(t *testing.T) {
+func TestLocalStore_ListConversationsEmpty(t *testing.T) {
 	store := newTestLocalStore(t)
 	ctx := context.Background()
 
-	entries, err := store.ListSessions(ctx)
+	entries, err := store.ListConversations(ctx)
 	if err != nil {
-		t.Fatalf("ListSessions: %v", err)
+		t.Fatalf("ListConversations: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Errorf("len(ListSessions) = %d, want 0", len(entries))
+		t.Errorf("len(ListConversations) = %d, want 0", len(entries))
+	}
+}
+
+func TestLocalStore_GetConversation_RejectsStaleSchema(t *testing.T) {
+	store := newTestLocalStore(t)
+	ctx := context.Background()
+
+	// Write a file with the old "session_id" JSON key (pre-rename schema).
+	// GetConversation must reject this rather than silently returning an
+	// empty ConversationID.
+	staleJSON := `{
+		"schema_version": 1,
+		"source": "opencode",
+		"session_id": "old-conv-001",
+		"messages": [{"role": "user", "content": "hello"}]
+	}`
+	dir := filepath.Join(store.Root(), "conversations", "opencode")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "old-conv-001.json"), []byte(staleJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := store.GetConversation(ctx, "opencode", "old-conv-001")
+	if err == nil {
+		t.Fatal("expected error for stale session_id schema, got nil")
 	}
 }
