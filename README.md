@@ -1,7 +1,7 @@
 # Muse
 
-An AI that thinks like you. Derived from your conversation history
-across Claude Code, Kiro, and OpenCode.
+An AI that thinks like you. Derived from your conversation history across Claude Code, Kiro, and
+OpenCode.
 
 ## Install
 
@@ -18,7 +18,14 @@ muse listen               # start MCP server
 muse show                 # print muse.md
 ```
 
-Wire up the MCP server so agents can ask your muse questions:
+Work directly with your muse as agent:
+
+```json
+// OpenCode — ~/.config/opencode/opencode.json
+{ "instructions": ["~/.muse/muse.md"] }
+```
+
+Or run as an MCP server so other agents can work with your muse:
 
 ```json
 {
@@ -36,15 +43,15 @@ Wire up the MCP server so agents can ask your muse questions:
 Conversations are automatically discovered from:
 
 - **Claude Code** — `~/.claude/projects/`
-- **Kiro** — `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/`
+- **Kiro** —
+  `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/`
 - **OpenCode** — `~/.local/share/opencode/opencode.db`
 - **Codex** — `~/.codex/`
 
 ## Storage
 
-By default, data is stored locally at `~/.muse/`. To use an S3 bucket instead
-(for sharing across machines or hosted deployment), set the `MUSE_BUCKET`
-environment variable:
+By default, data is stored locally at `~/.muse/`. To use an S3 bucket instead (for sharing across
+machines or hosted deployment), set the `MUSE_BUCKET` environment variable:
 
 ```bash
 export MUSE_BUCKET=$USER-muse
