@@ -339,7 +339,7 @@ func runObserve(
 		pending = append(pending, e)
 	}
 
-	// Sort newest first, apply limit
+	// Sort newest first so the limit keeps the most recent conversations.
 	sort.Slice(pending, func(i, j int) bool {
 		return pending[i].LastModified.After(pending[j].LastModified)
 	})
@@ -347,6 +347,11 @@ func runObserve(
 	if opts.Limit > 0 && len(pending) > opts.Limit {
 		pending = pending[:opts.Limit]
 	}
+	// Re-sort largest first so the most expensive conversations start
+	// processing immediately rather than landing in the tail.
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].SizeBytes > pending[j].SizeBytes
+	})
 
 	var mu sync.Mutex
 	var firstErr error
@@ -490,7 +495,7 @@ func conversationDataSize(conv *conversation.Conversation) int {
 // code blocks are stripped, tool output is collapsed to [tool: name] markers,
 // and long assistant messages are truncated.
 func extractObservations(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]string, inference.Usage, error) {
-	refined, usage, err := extractAndRefine(ctx, client, conv)
+	refined, usage, err := extractAndRefine(ctx, client, conv, verbose)
 	if err != nil {
 		return nil, usage, err
 	}
@@ -529,7 +534,7 @@ func extractObservations(ctx context.Context, client inference.Client, conv *con
 // prompt in chunks, and refines the candidates into a single text.
 // Both the map-reduce path (which wants raw text) and the clustering path
 // (which further parses into discrete items) call this function.
-func extractAndRefine(ctx context.Context, client inference.Client, conv *conversation.Conversation) (string, inference.Usage, error) {
+func extractAndRefine(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) (string, inference.Usage, error) {
 	turns := extractTurns(conv)
 	if len(turns) == 0 {
 		return "", inference.Usage{}, nil
@@ -544,9 +549,14 @@ func extractAndRefine(ctx context.Context, client inference.Client, conv *conver
 
 	// Extract candidates (Pass 1)
 	var allCandidates []string
-	for _, chunk := range chunks {
+	for i, chunk := range chunks {
+		start := time.Now()
 		obs, usage, err := inference.Converse(ctx, client, prompts.Extract, chunk, inference.WithMaxTokens(4096))
 		totalUsage = totalUsage.Add(usage)
+		if verbose {
+			fmt.Fprintf(os.Stderr, "      extract[%d/%d] %d chars → %d chars (%s, $%.4f)\n",
+				i+1, len(chunks), len(chunk), len(obs), time.Since(start).Round(time.Millisecond), usage.Cost())
+		}
 		if err != nil && obs == "" {
 			return "", totalUsage, err
 		}
@@ -560,8 +570,13 @@ func extractAndRefine(ctx context.Context, client inference.Client, conv *conver
 
 	// Refine (Pass 2)
 	candidates := strings.Join(allCandidates, "\n\n")
+	start := time.Now()
 	refined, usage, err := inference.Converse(ctx, client, prompts.Refine, candidates, inference.WithMaxTokens(4096))
 	totalUsage = totalUsage.Add(usage)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "      refine %d chars → %d chars (%s, $%.4f)\n",
+			len(candidates), len(refined), time.Since(start).Round(time.Millisecond), usage.Cost())
+	}
 	if err != nil && refined == "" {
 		return "", totalUsage, err
 	}
