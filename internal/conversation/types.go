@@ -66,6 +66,17 @@ func Providers() []Provider {
 	return providers
 }
 
+// DefaultSourceNames returns the names of all non-opt-in sources.
+func DefaultSourceNames() []string {
+	var names []string
+	for _, s := range Sources() {
+		if !s.OptIn {
+			names = append(names, s.Name)
+		}
+	}
+	return names
+}
+
 // ProvidersFor returns providers matching the given source names. Includes
 // opt-in providers when explicitly named. Returns all default providers
 // when sources is empty.
@@ -76,14 +87,6 @@ func ProvidersFor(sources []string) []Provider {
 	wanted := make(map[string]bool, len(sources))
 	for _, s := range sources {
 		wanted[s] = true
-	}
-	// --all: include everything
-	if wanted["all"] {
-		var providers []Provider
-		for _, s := range Sources() {
-			providers = append(providers, s.Provider)
-		}
-		return providers
 	}
 	var providers []Provider
 	for _, s := range Sources() {
@@ -106,6 +109,25 @@ type Conversation struct {
 	ParentID       string    `json:"parent_id,omitempty"`
 	SubagentIDs    []string  `json:"subagent_ids,omitempty"`
 	Messages       []Message `json:"messages"`
+}
+
+// UnmarshalJSON implements backward-compatible deserialization for Conversation.
+// Upstream tools rename fields without notice (e.g. session_id → conversation_id).
+// Per designs/sources.md "Format compatibility", the parser accepts both names.
+func (c *Conversation) UnmarshalJSON(data []byte) error {
+	// Alias avoids infinite recursion on UnmarshalJSON.
+	type Alias Conversation
+	aux := &struct {
+		*Alias
+		SessionID string `json:"session_id"`
+	}{Alias: (*Alias)(c)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if c.ConversationID == "" && aux.SessionID != "" {
+		c.ConversationID = aux.SessionID
+	}
+	return nil
 }
 
 // Validate checks that required fields are present. This catches silent

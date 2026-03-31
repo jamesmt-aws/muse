@@ -2,8 +2,8 @@ package prompts
 
 import _ "embed"
 
-//go:embed extract.md
-var Extract string
+//go:embed observe.md
+var Observe string
 
 //go:embed refine.md
 var Refine string
@@ -34,3 +34,12 @@ var Theme string
 
 //go:embed observe-human.md
 var ObserveHuman string
+
+//go:embed judge-dimensions.md
+var JudgeDimensions string
+
+//go:embed judge-preference.md
+var JudgePreference string
+
+//go:embed generate-eval.md
+var GenerateEval string

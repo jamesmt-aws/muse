@@ -14,6 +14,7 @@ go install github.com/ellistarn/muse@latest
 ```bash
 muse compose              # discover conversations and compose muse.md
 muse ask "your question"  # ask your muse directly
+muse eval                 # evaluate the muse against a base model
 muse listen               # start MCP server
 muse show                 # print muse.md
 muse show -o muse.pdf     # export as PDF
@@ -41,17 +42,18 @@ Or run as an MCP server so other agents can work with your muse:
 
 ## Sources
 
-Conversations are automatically discovered from:
+Local sources are activated automatically on first run: **Claude Code**, **OpenCode**, **Codex**, **Kiro**.
 
-- **Claude Code** — `~/.claude/projects/`
-- **Kiro** —
-  `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/`
-- **OpenCode** — `~/.local/share/opencode/opencode.db`
-- **Codex** — `~/.codex/`
-- **Slack** (opt-in) — Set `MUSE_SLACK_TOKEN` to a cookie file path for SAML SSO
-  or a raw token (`xoxp-`/`xoxc-`). Set `MUSE_SLACK_WORKSPACE` to your workspace
-  (comma-separated for multiple, e.g. `company.enterprise.slack.com`).
-  Run `muse compose slack`.
+Network sources require explicit opt-in:
+
+```bash
+muse add github                     # GitHub PRs and issues (requires gh auth)
+muse add slack                      # Slack (set MUSE_SLACK_TOKEN and MUSE_SLACK_WORKSPACE)
+muse remove github                  # stop including a source
+muse sources                        # see what's active
+```
+
+Sources are remembered across runs — `muse compose` processes whatever is active.
 
 ## Storage
 

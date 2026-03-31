@@ -72,6 +72,7 @@ func renderPDF(markdown, path string) error {
 	renderer := mdtopdf.NewPdfRenderer(mdtopdf.PdfRendererParams{
 		PdfFile: path,
 		Theme:   mdtopdf.LIGHT,
+		Opts:    []mdtopdf.RenderOption{mdtopdf.WithUnicodeTranslator("")},
 	})
 	return renderer.Process([]byte(markdown))
 }
@@ -110,7 +111,7 @@ func runShowDiff(cmd *cobra.Command, store storage.Store) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "Computing diff...")
-	client, err := newLLMClient(ctx, TierObserve)
+	client, err := newLLMClient(ctx, TierFast)
 	if err != nil {
 		return fmt.Errorf("llm client: %w", err)
 	}

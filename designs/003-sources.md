@@ -1,7 +1,7 @@
 # Sources
 
 A source normalizes platform-specific conversation data into muse's `Conversation` type (see
-grammar.md). The source owns everything about how to find, fetch, and parse its data. Muse owns
+002-grammar.md). The source owns everything about how to find, fetch, and parse its data. Muse owns
 everything after normalization — it does not know or care whether a conversation came from a local
 JSONL file, a SQLite database, or a paginated API.
 
@@ -22,7 +22,7 @@ review comments, issue comments, and review bodies are three separate API surfac
 merged chronologically to reconstruct what actually happened.
 
 Sources that make novel decisions beyond this design document them in their own designs
-(github-source.md, slack-source.md). A source where one session maps to one conversation — like any
+(007-github-source.md, 008-slack-source.md). A source where one session maps to one conversation — like any
 local AI coding tool — doesn't need its own design.
 
 ## Role mapping
@@ -74,6 +74,19 @@ filtering, role mapping, or chunking. Changes to assembly logic don't require re
 
 **Incremental sync.** First run fetches historical data, subject to API limits. Subsequent runs fetch
 only the delta since last sync.
+
+## Production order
+
+`Conversations` should return conversations in roughly newest-first order by last-modified
+timestamp. The streaming pipeline (`discover-observe-streaming.md`) uses per-source watermarks to
+determine when the N most recent conversations across all sources have been identified. A source
+that produces newest-first enables early termination — the pipeline can stop fetching from a source
+once its watermark falls below the Nth conversation. A source that produces in arbitrary order
+cannot benefit from early termination and must finish completely.
+
+Local sources can sort by file modification time before returning. API sources with incremental
+sync (GitHub, Slack) already fetch newest-first because they query by descending update time. A
+source that cannot guarantee ordering is still correct — it just cannot be terminated early.
 
 ## Registration and configuration
 
