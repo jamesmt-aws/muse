@@ -69,26 +69,32 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 				return err
 			}
 
-			// Discover and store new conversations (skip for --learn since it
-			// only recomposes from existing observations)
-			var uploaded, uploadBytes int
-			if !learn {
-				result, err := muse.Upload(ctx, store, syncProgressRenderer(), sources...)
-				if err != nil {
-					return err
-				}
-				for _, w := range result.Warnings {
-					fmt.Fprintf(os.Stderr, "warning: %s\n", w)
-				}
-				printSyncSummary(result)
-				uploaded = result.Uploaded
-				uploadBytes = result.Bytes
-			}
-
 			switch method {
 			case "clustering":
-				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, reobserve, relabel, limit, uploaded, uploadBytes)
+				// Clustering uses the streaming pipeline: discover, upload,
+				// and observe run concurrently through channels.
+				if learn {
+					return runClusteredCompose(ctx, cmd.OutOrStdout(), store, reobserve, relabel, limit, nil, nil)
+				}
+				providers := conversation.ProvidersFor(sources)
+				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, reobserve, relabel, limit, providers, syncProgressRenderer())
 			case "map-reduce":
+				// Map-reduce still uses the legacy sequential path.
+				var uploaded, uploadBytes int
+				if !learn {
+					result, err := muse.Upload(ctx, store, syncProgressRenderer(), sources...)
+					if err != nil {
+						return err
+					}
+					for _, w := range result.Warnings {
+						fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+					}
+					printSyncSummary(result)
+					uploaded = result.Uploaded
+					uploadBytes = result.Bytes
+				}
+				_ = uploaded
+				_ = uploadBytes
 				return runMapReduceCompose(ctx, cmd.OutOrStdout(), store, reobserve, learn, limit)
 			default:
 				return fmt.Errorf("unknown method %q (use 'clustering' or 'map-reduce')", method)
@@ -103,7 +109,7 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 	return cmd
 }
 
-func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, relabel bool, limit, uploaded, uploadBytes int) error {
+func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, relabel bool, limit int, providers []conversation.Provider, syncProgress muse.SyncProgressFunc) error {
 	observeLLM, err := newLLMClient(ctx, TierFast)
 	if err != nil {
 		return err
@@ -113,21 +119,26 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 		return err
 	}
 
+	opts := compose.ClusteredOptions{
+		BaseOptions: compose.BaseOptions{
+			Reobserve: reobserve,
+			Limit:     limit,
+			Verbose:   verbose,
+		},
+		Relabel:   relabel,
+		Providers: providers,
+		Store:     store,
+	}
+	if syncProgress != nil {
+		opts.SyncProgress = syncProgress
+	}
+
 	result, err := compose.RunClustered(ctx, store,
 		observeLLM, // observe
 		observeLLM, // label
 		observeLLM, // summarize
 		composeLLM, // compose
-		compose.ClusteredOptions{
-			BaseOptions: compose.BaseOptions{
-				Reobserve: reobserve,
-				Limit:     limit,
-				Verbose:   verbose,
-			},
-			Relabel:     relabel,
-			Uploaded:    uploaded,
-			UploadBytes: uploadBytes,
-		},
+		opts,
 	)
 	if err != nil {
 		return err

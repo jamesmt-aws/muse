@@ -15,6 +15,7 @@ import (
 
 	"github.com/ellistarn/muse/internal/conversation"
 	"github.com/ellistarn/muse/internal/inference"
+	"github.com/ellistarn/muse/internal/pipeline"
 	"github.com/ellistarn/muse/internal/storage"
 	"github.com/ellistarn/muse/prompts"
 )
@@ -33,7 +34,20 @@ type ClusteredOptions struct {
 	BaseOptions
 	Relabel bool // force re-label all observations
 
+	// Providers, when set, enables the streaming pipeline: discover, upload,
+	// and observe run concurrently through channels instead of sequentially.
+	// When nil, the legacy sequential path is used.
+	Providers []conversation.Provider
+
+	// Store is required when Providers is set, for upload and fingerprint checks.
+	Store storage.Store
+
+	// SyncProgress receives progress updates from source providers during
+	// streaming pipeline discovery.
+	SyncProgress func(source string, p conversation.SyncProgress)
+
 	// Upload results from the load phase, folded into the discover line.
+	// Used only by the legacy (non-streaming) path.
 	Uploaded    int // new conversations ingested this run
 	UploadBytes int // total bytes of new conversations
 }
@@ -57,7 +71,13 @@ func RunClustered(
 	// ── OBSERVE ─────────────────────────────────────────────────────────
 	var observeCounter atomic.Int32
 	observeStart := time.Now()
-	observeResult, err := runObserve(ctx, store, observeLLM, opts, &observeCounter)
+	var observeResult *observeResult
+	var err error
+	if len(opts.Providers) > 0 {
+		observeResult, err = runStreamingObserve(ctx, store, observeLLM, opts, &observeCounter)
+	} else {
+		observeResult, err = runObserve(ctx, store, observeLLM, opts, &observeCounter)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("observe: %w", err)
 	}
@@ -452,6 +472,179 @@ func runObserve(
 		pending:      len(pending),
 		pruned:       pruned,
 		remaining:    totalPending - len(pending),
+		usage:        usage,
+		dataSize:     dataSize,
+	}, nil
+}
+
+// runStreamingObserve uses the streaming pipeline to discover, upload, and
+// observe conversations concurrently through channels. It produces the same
+// observeResult as the legacy runObserve for compatibility with RunClustered.
+func runStreamingObserve(
+	ctx context.Context,
+	store storage.Store,
+	llm inference.Client,
+	opts ClusteredOptions,
+	counter *atomic.Int32,
+) (*observeResult, error) {
+	// Handle reobserve: clear all observations before the pipeline starts.
+	if opts.Reobserve {
+		DeleteObservations(ctx, store)
+		fmt.Fprintln(os.Stderr, "  Cleared all observations")
+	}
+
+	// Pre-fetch existing conversations for diffing in the upload func.
+	existing, err := store.ListConversations(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations: %w", err)
+	}
+	remote := map[string]storage.ConversationEntry{}
+	for _, e := range existing {
+		remote[e.Key] = e
+	}
+
+	// Compute prompt chain hash for fingerprinting.
+	promptHash := Fingerprint(prompts.Observe, prompts.ObserveHuman, prompts.Refine)
+
+	var mu sync.Mutex
+	var usage inference.Usage
+	var dataSize int
+	var uploadBytes int
+	var uploadedCount int
+
+	pipeResult, err := pipeline.Run(ctx, pipeline.Config{
+		UploadGoroutines:  20,
+		ObserveGoroutines: 50,
+		Limit:          opts.Limit,
+		Providers:      opts.Providers,
+		SyncProgress:   opts.SyncProgress,
+
+		Upload: func(ctx context.Context, conv *conversation.Conversation) (storage.ConversationEntry, bool, error) {
+			key := fmt.Sprintf("conversations/%s/%s.json", conv.Source, conv.ConversationID)
+
+			// Diff against store: skip if unchanged.
+			if entry, exists := remote[key]; exists {
+				if !conv.UpdatedAt.After(entry.LastModified) {
+					// Conversation unchanged. Still need to check if observation exists.
+					fp := Fingerprint(entry.LastModified.Format(time.RFC3339Nano), promptHash)
+					obs, err := GetObservations(ctx, store, entry.Source, entry.ConversationID)
+					if err == nil && obs.Fingerprint == fp {
+						return entry, false, nil // skip: up to date
+					}
+					return entry, true, nil // needs observation
+				}
+			}
+
+			// Upload new or changed conversation. New uploads always need
+			// observation — no stored observation can match a conversation
+			// that was just uploaded with a new timestamp.
+			n, err := store.PutConversation(ctx, conv)
+			if err != nil {
+				return storage.ConversationEntry{}, false, fmt.Errorf("upload %s: %w", conv.ConversationID, err)
+			}
+
+			mu.Lock()
+			uploadedCount++
+			uploadBytes += n
+			mu.Unlock()
+
+			return storage.ConversationEntry{
+				Source:         conv.Source,
+				ConversationID: conv.ConversationID,
+				Key:            key,
+				LastModified:   conv.UpdatedAt,
+			}, true, nil
+		},
+
+		Observe: func(ctx context.Context, entry storage.ConversationEntry) error {
+			conv, err := store.GetConversation(ctx, entry.Source, entry.ConversationID)
+			if err != nil {
+				counter.Add(1)
+				return fmt.Errorf("load conversation %s: %w", entry.Key, err)
+			}
+
+			convBytes := conversationDataSize(conv)
+
+			start := time.Now()
+			items, u, err := observeAndParse(ctx, llm, conv, opts.Verbose)
+			n := counter.Add(1)
+			if err != nil {
+				return fmt.Errorf("observe %s: %w", entry.Key, err)
+			}
+
+			fp := Fingerprint(entry.LastModified.Format(time.RFC3339Nano), promptHash)
+			observation := &Observations{
+				Fingerprint: fp,
+				Date:        entry.LastModified.Format("2006-01-02"),
+				Items:       items,
+			}
+			if err := PutObservations(ctx, store, entry.Source, entry.ConversationID, observation); err != nil {
+				return fmt.Errorf("save observations for %s: %w", entry.Key, err)
+			}
+
+			if opts.Verbose {
+				fmt.Fprintf(os.Stderr, "  [%d] Observed ~/.muse/%s (%d obs, %s, $%.4f)\n",
+					n, observationPath(entry.Source, entry.ConversationID), len(items),
+					time.Since(start).Round(time.Millisecond), u.Cost())
+			}
+			mu.Lock()
+			usage = usage.Add(u)
+			dataSize += convBytes
+			mu.Unlock()
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Build source list and counts for the discover log line.
+	var sources []string
+	for s := range pipeResult.SourceCounts {
+		sources = append(sources, s)
+	}
+	sort.Strings(sources)
+
+	// Print discover line.
+	discoverLine := logStage("discover", "%d sources → %d conversations %s",
+		len(sources), pipeResult.Discovered,
+		formatSourceBreakdown(pipeResult.SourceCounts))
+	if uploadedCount > 0 {
+		noun := "conversations"
+		if uploadedCount == 1 {
+			noun = "conversation"
+		}
+		discoverLine.Tail = fmt.Sprintf("(%d new %s, %s)", uploadedCount, noun, FormatBytes(uploadBytes))
+	}
+	discoverLine.Print()
+
+	// Print observe line.
+	if pipeResult.Observed > 0 {
+		cacheNote := ""
+		if pipeResult.Skipped > 0 {
+			cacheNote = fmt.Sprintf(" (%d cached)", pipeResult.Skipped)
+		}
+		noun := "conversations"
+		if pipeResult.Observed == 1 {
+			noun = "conversation"
+		}
+		logBefore("observe", "%d %s%s", pipeResult.Observed, noun, cacheNote)
+	} else if pipeResult.Skipped > 0 {
+		logBefore("observe", "%d conversations cached", pipeResult.Skipped)
+	}
+
+	for _, w := range pipeResult.Warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+
+	return &observeResult{
+		discovered:   pipeResult.Discovered,
+		sources:      sources,
+		sourceCounts: pipeResult.SourceCounts,
+		processed:    pipeResult.Observed,
+		pending:      pipeResult.Observed,
+		pruned:       pipeResult.Skipped,
+		remaining:    pipeResult.Remaining,
 		usage:        usage,
 		dataSize:     dataSize,
 	}, nil
