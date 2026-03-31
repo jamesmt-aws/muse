@@ -75,6 +75,19 @@ filtering, role mapping, or chunking. Changes to assembly logic don't require re
 **Incremental sync.** First run fetches historical data, subject to API limits. Subsequent runs fetch
 only the delta since last sync.
 
+## Production order
+
+`Conversations` should return conversations in roughly newest-first order by last-modified
+timestamp. The streaming pipeline (`discover-observe-streaming.md`) uses per-source watermarks to
+determine when the N most recent conversations across all sources have been identified. A source
+that produces newest-first enables early termination — the pipeline can stop fetching from a source
+once its watermark falls below the Nth conversation. A source that produces in arbitrary order
+cannot benefit from early termination and must finish completely.
+
+Local sources can sort by file modification time before returning. API sources with incremental
+sync (GitHub, Slack) already fetch newest-first because they query by descending update time. A
+source that cannot guarantee ordering is still correct — it just cannot be terminated early.
+
 ## Registration and configuration
 
 Sources are registered in a hardcoded list. There is no plugin system — every source requires
