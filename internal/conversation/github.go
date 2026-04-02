@@ -171,9 +171,21 @@ func retryAfterDuration(resp *http.Response) time.Duration {
 // GitHub reads conversations from GitHub PR and issue comment threads.
 // Threads are cached locally so the API cost is paid once; subsequent runs
 // only fetch threads updated since the last sync.
-type GitHub struct{}
+// GitHub is the conversation provider for GitHub PRs and issues.
+// When TargetUser is set, conversations are built from that user's perspective
+// instead of the authenticated user's. RepoFilter restricts search to matching
+// repositories (e.g. "karpenter" matches repo:*/karpenter*).
+type GitHub struct {
+	TargetUser string // override: build muse for this user instead of authenticated user
+	RepoFilter string // optional: restrict to repos matching this pattern
+}
 
-func (g *GitHub) Name() string { return "GitHub" }
+func (g *GitHub) Name() string {
+	if g.TargetUser != "" {
+		return "GitHub"
+	}
+	return "GitHub"
+}
 
 // cachedThread stores raw API data for a single GitHub thread.
 // Stored upstream of conversation assembly so formatting changes
@@ -243,9 +255,29 @@ func (g *GitHub) Conversations(ctx context.Context, progress func(SyncProgress))
 	httpClient := &http.Client{Transport: transport}
 	client := github.NewClient(httpClient).WithAuthToken(token)
 
-	username, err := resolveGitHubUsername(ctx, client)
-	if err != nil {
-		return nil, err
+	username := g.TargetUser
+	if username == "" {
+		username, err = resolveGitHubUsername(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Peer muses use a separate cache dir to avoid mixing with the owner's.
+	if g.TargetUser != "" {
+		peerDir := filepath.Join(cacheDir, "peers", g.TargetUser)
+		if g.RepoFilter != "" {
+			peerDir = filepath.Join(peerDir, g.RepoFilter)
+		}
+		if err := os.MkdirAll(peerDir, 0o755); err != nil {
+			return nil, err
+		}
+		cacheDir = peerDir
+		// Re-create HTTP cache in peer dir.
+		httpResponseCache, err = newHTTPCache(cacheDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	state := loadGitHubSyncState(cacheDir)
@@ -256,9 +288,23 @@ func (g *GitHub) Conversations(ctx context.Context, progress func(SyncProgress))
 		state = githubSyncState{}
 	}
 
-	// Sync: discover and fetch threads from the API
+	// Resolve repo filter into specific repos.
+	var repos []string
+	if g.RepoFilter != "" {
+		repos, err = resolveRepoFilter(ctx, client, username, g.RepoFilter)
+		if err != nil {
+			return nil, err
+		}
+		if len(repos) == 0 {
+			return nil, fmt.Errorf("no repos matching %q with activity from %s", g.RepoFilter, username)
+		}
+		progress(SyncProgress{Phase: "log", Detail: fmt.Sprintf("repos: %s", strings.Join(repos, ", "))})
+	}
+
+	// Sync: discover and fetch threads from the API.
+	// When repos are specified, sync each repo separately.
 	syncStart := time.Now()
-	if err := syncGitHubThreads(ctx, client, username, cacheDir, state, progress); err != nil {
+	if err := syncGitHubThreads(ctx, client, username, repos, cacheDir, state, progress); err != nil {
 		// Partial sync is fine — cache what we got. Don't advance the sync
 		// timestamp so the next run retries.
 		progress(SyncProgress{Phase: "log", Detail: fmt.Sprintf("warning: sync incomplete: %v", err)})
@@ -404,15 +450,72 @@ func loadAllCachedThreads(cacheDir string) ([]cachedThread, error) {
 
 // ── Sync ───────────────────────────────────────────────────────────────
 
-func syncGitHubThreads(ctx context.Context, client *github.Client, username, cacheDir string, state githubSyncState, progress func(SyncProgress)) error {
-	if state.LastSync.IsZero() {
-		return syncGitHubFull(ctx, client, username, cacheDir, progress)
+// resolveRepoFilter turns a project name into repo: qualifiers for the GitHub
+// search API. Exact "owner/repo" is used directly. Unqualified names like
+// "karpenter" are resolved by searching for repos matching that name, then
+// filtering to repos where the target user has activity.
+func resolveRepoFilter(ctx context.Context, client *github.Client, username, filter string) ([]string, error) {
+	if filter == "" {
+		return nil, nil
 	}
-	return syncGitHubIncremental(ctx, client, username, cacheDir, state.LastSync, progress)
+	if strings.Contains(filter, "/") {
+		return []string{filter}, nil
+	}
+
+	// Search for repos matching the project name.
+	result, _, err := client.Search.Repositories(ctx, filter+" in:name fork:false", &github.SearchOptions{
+		Sort:        "stars",
+		ListOptions: github.ListOptions{PerPage: 20},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search repos for %q: %w", filter, err)
+	}
+
+	// Filter to repos where the user actually has activity.
+	var repos []string
+	for _, repo := range result.Repositories {
+		name := repo.GetFullName()
+		query := fmt.Sprintf("involves:%s repo:%s type:pr", username, name)
+		count, err := searchGitHubCount(ctx, client, query)
+		if err != nil {
+			continue
+		}
+		if count > 0 {
+			repos = append(repos, name)
+		}
+	}
+	return repos, nil
 }
 
-func syncGitHubFull(ctx context.Context, client *github.Client, username, cacheDir string, progress func(SyncProgress)) error {
+func syncGitHubThreads(ctx context.Context, client *github.Client, username string, repos []string, cacheDir string, state githubSyncState, progress func(SyncProgress)) error {
+	if len(repos) > 0 {
+		// Sync each repo separately.
+		for _, repo := range repos {
+			if state.LastSync.IsZero() {
+				if err := syncGitHubFull(ctx, client, username, repo, cacheDir, progress); err != nil {
+					return err
+				}
+			} else {
+				if err := syncGitHubIncremental(ctx, client, username, repo, cacheDir, state.LastSync, progress); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if state.LastSync.IsZero() {
+		return syncGitHubFull(ctx, client, username, "", cacheDir, progress)
+	}
+	return syncGitHubIncremental(ctx, client, username, "", cacheDir, state.LastSync, progress)
+}
+
+func syncGitHubFull(ctx context.Context, client *github.Client, username, repo, cacheDir string, progress func(SyncProgress)) error {
 	progress(SyncProgress{Phase: "discovering"})
+
+	repoQ := ""
+	if repo != "" {
+		repoQ = " repo:" + repo
+	}
 
 	for _, isPR := range []bool{true, false} {
 		kind := "pr"
@@ -421,7 +524,7 @@ func syncGitHubFull(ctx context.Context, client *github.Client, username, cacheD
 		}
 
 		// Check total to decide strategy
-		baseQuery := fmt.Sprintf("involves:%s type:%s", username, kind)
+		baseQuery := fmt.Sprintf("involves:%s type:%s", username, kind) + repoQ
 		total, err := searchGitHubCount(ctx, client, baseQuery)
 		if err != nil {
 			return fmt.Errorf("count %ss: %w", kind, err)
@@ -436,7 +539,7 @@ func syncGitHubFull(ctx context.Context, client *github.Client, username, cacheD
 				return err
 			}
 		} else {
-			if err := dateSegmentedSearch(ctx, client, username, kind, isPR, cacheDir, progress); err != nil {
+			if err := dateSegmentedSearch(ctx, client, username, repo, kind, isPR, cacheDir, progress); err != nil {
 				return err
 			}
 		}
@@ -444,16 +547,21 @@ func syncGitHubFull(ctx context.Context, client *github.Client, username, cacheD
 	return nil
 }
 
-func syncGitHubIncremental(ctx context.Context, client *github.Client, username, cacheDir string, since time.Time, progress func(SyncProgress)) error {
+func syncGitHubIncremental(ctx context.Context, client *github.Client, username, repo, cacheDir string, since time.Time, progress func(SyncProgress)) error {
 	sinceStr := since.Format("2006-01-02T15:04:05Z")
 	progress(SyncProgress{Phase: "discovering"})
+
+	repoQ := ""
+	if repo != "" {
+		repoQ = " repo:" + repo
+	}
 
 	for _, isPR := range []bool{true, false} {
 		kind := "pr"
 		if !isPR {
 			kind = "issue"
 		}
-		query := fmt.Sprintf("involves:%s type:%s updated:>=%s", username, kind, sinceStr)
+		query := fmt.Sprintf("involves:%s type:%s updated:>=%s", username, kind, sinceStr) + repoQ
 		issues, err := searchAllGitHubIssues(ctx, client, query)
 		if err != nil {
 			return fmt.Errorf("incremental %ss: %w", kind, err)
@@ -469,7 +577,11 @@ func syncGitHubIncremental(ctx context.Context, client *github.Client, username,
 // into months when a year exceeds the 1000-result search API limit.
 // Recent-first means interrupted syncs capture the most valuable content
 // first, and already-cached threads are skipped on re-run.
-func dateSegmentedSearch(ctx context.Context, client *github.Client, username, kind string, isPR bool, cacheDir string, progress func(SyncProgress)) error {
+func dateSegmentedSearch(ctx context.Context, client *github.Client, username, repo, kind string, isPR bool, cacheDir string, progress func(SyncProgress)) error {
+	repoQ := ""
+	if repo != "" {
+		repoQ = " repo:" + repo
+	}
 	now := time.Now()
 	for year := now.Year(); year >= 2008; year-- {
 		start := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -480,7 +592,7 @@ func dateSegmentedSearch(ctx context.Context, client *github.Client, username, k
 
 		yearQuery := fmt.Sprintf("involves:%s type:%s created:%s..%s",
 			username, kind,
-			start.Format("2006-01-02"), end.Format("2006-01-02"))
+			start.Format("2006-01-02"), end.Format("2006-01-02")) + repoQ
 
 		yearTotal, err := searchGitHubCount(ctx, client, yearQuery)
 		if err != nil {
@@ -512,7 +624,7 @@ func dateSegmentedSearch(ctx context.Context, client *github.Client, username, k
 
 				mQuery := fmt.Sprintf("involves:%s type:%s created:%s..%s",
 					username, kind,
-					mStart.Format("2006-01-02"), mEnd.Format("2006-01-02"))
+					mStart.Format("2006-01-02"), mEnd.Format("2006-01-02")) + repoQ
 
 				issues, err := searchAllGitHubIssues(ctx, client, mQuery)
 				if err != nil {

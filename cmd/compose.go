@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ func newComposeCmd() *cobra.Command {
 	var learn bool
 	var limit int
 	var method string
+	var project string
 	cmd := &cobra.Command{
 		Use:   "compose",
 		Short: "Compose a muse from conversations",
@@ -53,9 +55,15 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
   muse compose --method=map-reduce      # simpler pipeline
   muse compose --reobserve              # re-observe all from scratch
   muse compose --learn                  # recompose from existing observations
-  muse compose --limit 50              # process at most 50 conversations`,
+  muse compose --limit 50              # process at most 50 conversations
+  muse compose github/ellistarn --project karpenter   # peer muse`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+
+			// Check for peer muse syntax: source/username (e.g. github/ellistarn)
+			if peer, source, username := parsePeerArg(args); peer {
+				return runPeerCompose(ctx, cmd.OutOrStdout(), source, username, project, reobserve, relabel, limit)
+			}
 
 			store, err := newStore(ctx)
 			if err != nil {
@@ -106,6 +114,7 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 	cmd.Flags().BoolVar(&learn, "learn", false, "skip observe, recompose muse from existing observations (map-reduce only)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max conversations to observe per run (0 = no limit)")
 	cmd.Flags().StringVar(&method, "method", "clustering", "composition method: clustering or map-reduce")
+	cmd.Flags().StringVar(&project, "project", "", "restrict peer muse to a project (e.g. karpenter)")
 	return cmd
 }
 
@@ -145,6 +154,53 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 	}
 
 	return printResult(stdout, result, false)
+}
+
+// parsePeerArg checks if the first arg matches "source/username" syntax.
+func parsePeerArg(args []string) (isPeer bool, source, username string) {
+	if len(args) == 0 {
+		return false, "", ""
+	}
+	parts := strings.SplitN(args[0], "/", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return false, "", ""
+	}
+	switch parts[0] {
+	case "github":
+		return true, "github", parts[1]
+	default:
+		return false, "", ""
+	}
+}
+
+// runPeerCompose builds a muse for a peer from their public activity.
+func runPeerCompose(ctx context.Context, stdout io.Writer, source, username, project string, reobserve, relabel bool, limit int) error {
+	// Create peer-scoped store.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	peerDir := fmt.Sprintf("github-%s", username)
+	if project != "" {
+		peerDir = fmt.Sprintf("github-%s/%s", username, project)
+	}
+	peerRoot := filepath.Join(home, ".muse", "peers", peerDir)
+	store := storage.NewLocalStoreWithRoot(peerRoot)
+
+	// Create the peer GitHub provider.
+	provider := &conversation.GitHub{
+		TargetUser: username,
+		RepoFilter: project,
+	}
+
+	fmt.Fprintf(os.Stderr, "Composing peer muse for %s/%s", source, username)
+	if project != "" {
+		fmt.Fprintf(os.Stderr, " (project: %s)", project)
+	}
+	fmt.Fprintln(os.Stderr)
+
+	return runClusteredCompose(ctx, stdout, store, reobserve, relabel, limit,
+		[]conversation.Provider{provider}, syncProgressRenderer())
 }
 
 func runMapReduceCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, learn bool, limit int) error {
