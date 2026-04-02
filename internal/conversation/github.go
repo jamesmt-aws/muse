@@ -252,13 +252,37 @@ func releaseGitHub() {
 // scoped to either PRs or issues via the kind field. The two instances share
 // authentication and rate limiting (see acquireGitHub) because they hit the
 // same API with the same token.
+//
+// When TargetUser is set, conversations are built from that user's perspective
+// instead of the authenticated user's. RepoFilter restricts search to matching
+// repositories (e.g. "karpenter" matches repos containing that name).
 type GitHub struct {
 	kind        string // "pr" or "issue" — the GitHub search type qualifier
 	source      string // conversation source name: "github-prs" or "github-issues"
 	displayName string // human-readable: "GitHub PRs" or "GitHub Issues"
+	TargetUser  string // override: build muse for this user instead of authenticated user
+	RepoFilter  string // optional: restrict to repos matching this pattern
 }
 
 func (g *GitHub) Name() string { return g.displayName }
+
+// NewPeerGitHub creates a GitHub provider for building a peer's muse.
+// kind is "pr" or "issue".
+func NewPeerGitHub(kind, targetUser, repoFilter string) *GitHub {
+	source := "github-prs"
+	display := "GitHub PRs"
+	if kind == "issue" {
+		source = "github-issues"
+		display = "GitHub Issues"
+	}
+	return &GitHub{
+		kind:        kind,
+		source:      source,
+		displayName: display,
+		TargetUser:  targetUser,
+		RepoFilter:  repoFilter,
+	}
+}
 
 // cachedThread stores raw API data for a single GitHub thread.
 // Stored upstream of conversation assembly so formatting changes
@@ -314,8 +338,34 @@ func (g *GitHub) Conversations(ctx context.Context, progress func(SyncProgress))
 	}
 	defer releaseGitHub()
 
+	// Peer muse: override username and use a separate cache directory.
+	if g.TargetUser != "" {
+		username = g.TargetUser
+		peerDir := filepath.Join(cacheDir, "peers", g.TargetUser)
+		if g.RepoFilter != "" {
+			peerDir = filepath.Join(peerDir, g.RepoFilter)
+		}
+		if err := os.MkdirAll(peerDir, 0o755); err != nil {
+			return nil, err
+		}
+		cacheDir = peerDir
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
+
+	// Resolve repo filter into specific repos.
+	var repos []string
+	if g.RepoFilter != "" {
+		repos, err = resolveRepoFilter(ctx, client, username, g.RepoFilter)
+		if err != nil {
+			return nil, err
+		}
+		if len(repos) == 0 {
+			return nil, fmt.Errorf("no repos matching %q with activity from %s", g.RepoFilter, username)
+		}
+		progress(SyncProgress{Phase: "log", Detail: fmt.Sprintf("repos: %s", strings.Join(repos, ", "))})
+	}
 
 	isPR := g.kind == "pr"
 	state := loadGitHubSyncState(cacheDir, g.kind)
@@ -326,9 +376,20 @@ func (g *GitHub) Conversations(ctx context.Context, progress func(SyncProgress))
 		state = githubSyncState{}
 	}
 
-	// Sync: discover and fetch threads for this kind from the API
+	// Sync: discover and fetch threads for this kind from the API.
+	// When repos are specified, sync each repo separately.
 	syncStart := time.Now()
-	if err := syncGitHubKind(ctx, client, username, cacheDir, g.kind, isPR, state, progress); err != nil {
+	if len(repos) > 0 {
+		for _, repo := range repos {
+			if err := syncGitHubKindRepo(ctx, client, username, cacheDir, g.kind, isPR, repo, state, progress); err != nil {
+				progress(SyncProgress{Phase: "log", Detail: fmt.Sprintf("warning: sync incomplete: %v", err)})
+			}
+		}
+		saveGitHubSyncState(cacheDir, g.kind, githubSyncState{
+			LastSync: syncStart,
+			Username: username,
+		})
+	} else if err := syncGitHubKind(ctx, client, username, cacheDir, g.kind, isPR, state, progress); err != nil {
 		// Partial sync is fine — cache what we got. Don't advance the sync
 		// timestamp so the next run retries.
 		progress(SyncProgress{Phase: "log", Detail: fmt.Sprintf("warning: sync incomplete: %v", err)})
@@ -473,6 +534,123 @@ func loadAllCachedThreads(cacheDir string) ([]cachedThread, error) {
 }
 
 // ── Sync ───────────────────────────────────────────────────────────────
+
+// resolveRepoFilter turns a project name into specific repo full names.
+// Exact "owner/repo" is used directly. Unqualified names search for repos
+// where the target user has activity.
+func resolveRepoFilter(ctx context.Context, client *github.Client, username, filter string) ([]string, error) {
+	if filter == "" {
+		return nil, nil
+	}
+	if strings.Contains(filter, "/") {
+		return []string{filter}, nil
+	}
+	result, _, err := client.Search.Repositories(ctx, filter+" in:name fork:false", &github.SearchOptions{
+		Sort:        "stars",
+		ListOptions: github.ListOptions{PerPage: 20},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search repos for %q: %w", filter, err)
+	}
+	var repos []string
+	for _, repo := range result.Repositories {
+		name := repo.GetFullName()
+		query := fmt.Sprintf("involves:%s repo:%s type:pr", username, name)
+		count, err := searchGitHubCount(ctx, client, query)
+		if err != nil {
+			continue
+		}
+		if count > 0 {
+			repos = append(repos, name)
+		}
+	}
+	return repos, nil
+}
+
+// syncGitHubKindRepo syncs a single kind (pr/issue) for a specific repo.
+func syncGitHubKindRepo(ctx context.Context, client *github.Client, username, cacheDir, kind string, isPR bool, repo string, state githubSyncState, progress func(SyncProgress)) error {
+	repoQ := " repo:" + repo
+	if state.LastSync.IsZero() {
+		progress(SyncProgress{Phase: "discovering"})
+		baseQuery := fmt.Sprintf("involves:%s type:%s", username, kind) + repoQ
+		total, err := searchGitHubCount(ctx, client, baseQuery)
+		if err != nil {
+			return fmt.Errorf("count %ss in %s: %w", kind, repo, err)
+		}
+		if total <= 1000 {
+			issues, err := searchAllGitHubIssues(ctx, client, baseQuery)
+			if err != nil {
+				return fmt.Errorf("search %ss in %s: %w", kind, repo, err)
+			}
+			return fetchAndCacheIssues(ctx, client, cacheDir, issues, isPR, progress)
+		}
+		return dateSegmentedSearchRepo(ctx, client, username, kind, isPR, repo, cacheDir, progress)
+	}
+	sinceStr := state.LastSync.Format("2006-01-02T15:04:05Z")
+	progress(SyncProgress{Phase: "discovering"})
+	query := fmt.Sprintf("involves:%s type:%s updated:>=%s", username, kind, sinceStr) + repoQ
+	issues, err := searchAllGitHubIssues(ctx, client, query)
+	if err != nil {
+		return fmt.Errorf("incremental %ss in %s: %w", kind, repo, err)
+	}
+	return fetchAndCacheIssues(ctx, client, cacheDir, issues, isPR, progress)
+}
+
+// dateSegmentedSearchRepo is like dateSegmentedSearch but scoped to a single repo.
+func dateSegmentedSearchRepo(ctx context.Context, client *github.Client, username, kind string, isPR bool, repo, cacheDir string, progress func(SyncProgress)) error {
+	repoQ := " repo:" + repo
+	now := time.Now()
+	for year := now.Year(); year >= 2008; year-- {
+		start := time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC)
+		end := time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC)
+		if end.After(now) {
+			end = now
+		}
+		yearQuery := fmt.Sprintf("involves:%s type:%s created:%s..%s",
+			username, kind,
+			start.Format("2006-01-02"), end.Format("2006-01-02")) + repoQ
+		yearTotal, err := searchGitHubCount(ctx, client, yearQuery)
+		if err != nil {
+			return err
+		}
+		if yearTotal == 0 {
+			continue
+		}
+		if yearTotal <= 1000 {
+			issues, err := searchAllGitHubIssues(ctx, client, yearQuery)
+			if err != nil {
+				return err
+			}
+			if err := fetchAndCacheIssues(ctx, client, cacheDir, issues, isPR, progress); err != nil {
+				return err
+			}
+		} else {
+			for month := time.December; month >= time.January; month-- {
+				mStart := time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
+				mEnd := mStart.AddDate(0, 1, 0)
+				if mStart.After(now) {
+					continue
+				}
+				if mEnd.After(now) {
+					mEnd = now
+				}
+				mQuery := fmt.Sprintf("involves:%s type:%s created:%s..%s",
+					username, kind,
+					mStart.Format("2006-01-02"), mEnd.Format("2006-01-02")) + repoQ
+				issues, err := searchAllGitHubIssues(ctx, client, mQuery)
+				if err != nil {
+					return err
+				}
+				if len(issues) > 0 {
+					if err := fetchAndCacheIssues(ctx, client, cacheDir, issues, isPR, progress); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
 
 func syncGitHubKind(ctx context.Context, client *github.Client, username, cacheDir, kind string, isPR bool, state githubSyncState, progress func(SyncProgress)) error {
 	if state.LastSync.IsZero() {
