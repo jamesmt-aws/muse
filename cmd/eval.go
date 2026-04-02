@@ -64,6 +64,10 @@ type cachedResponse struct {
 
 func newEvalCmd() *cobra.Command {
 	var evalDir string
+	var generative bool
+	var peer string
+	var project string
+	var genLimit int
 
 	cmd := &cobra.Command{
 		Use:   "eval",
@@ -80,12 +84,23 @@ A separate preference judge picks which response demonstrates better overall
 judgment, capturing signal the dimension scores may miss.
 
 Questions include universal judgment probes plus domain-specific questions
-generated from the muse.md to measure transferability.`,
+generated from the muse.md to measure transferability.
+
+Use --generative to run held-out evaluation against real conversations:
+  muse eval --generative --peer github/ellistarn --project karpenter`,
 		Example: `  muse eval
   muse eval -v
-  muse eval --dir ./my-questions`,
+  muse eval --dir ./my-questions
+  muse eval --generative --peer github/ellistarn --project karpenter`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+
+			if generative {
+				if peer == "" {
+					return fmt.Errorf("--generative requires --peer (e.g. --peer ellistarn)")
+				}
+				return runGenerativeEval(ctx, peer, project, genLimit)
+			}
 			store, err := newStore(ctx)
 			if err != nil {
 				return err
@@ -164,6 +179,10 @@ generated from the muse.md to measure transferability.`,
 		},
 	}
 	cmd.Flags().StringVar(&evalDir, "dir", "", "directory of additional .md question files")
+	cmd.Flags().BoolVar(&generative, "generative", false, "run held-out generative evaluation against real conversations")
+	cmd.Flags().StringVar(&peer, "peer", "", "peer username for generative eval (e.g. ellistarn)")
+	cmd.Flags().StringVar(&project, "project", "", "project scope for generative eval")
+	cmd.Flags().IntVar(&genLimit, "cases", 0, "max test cases for generative eval (0 = auto)")
 	return cmd
 }
 

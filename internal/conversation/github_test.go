@@ -83,7 +83,7 @@ func TestAssembleGitHubConversation(t *testing.T) {
 			{Author: "other", Body: "thanks", CreatedAt: base.Add(2 * time.Minute)},
 		}
 		conv := assembleGitHubConversation("owner", "github-prs", "org", "repo", 1, true, "Fix bug",
-			base, base.Add(time.Hour), messages)
+			base, base.Add(time.Hour), messages, 0)
 		if conv != nil {
 			t.Error("expected nil for thread with <2 owner messages")
 		}
@@ -97,7 +97,7 @@ func TestAssembleGitHubConversation(t *testing.T) {
 			{Author: "reviewer", Body: "lgtm", CreatedAt: base.Add(3 * time.Hour)},
 		}
 		conv := assembleGitHubConversation("owner", "github-prs", "org", "repo", 42, true, "Add feature",
-			base, base.Add(3*time.Hour), messages)
+			base, base.Add(3*time.Hour), messages, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -137,7 +137,7 @@ func TestAssembleGitHubConversation(t *testing.T) {
 			{Author: "owner", Body: "here's a fix", CreatedAt: base.Add(2 * time.Hour)},
 		}
 		conv := assembleGitHubConversation("owner", "github-issues", "org", "repo", 10, false, "Bug report",
-			base, base.Add(2*time.Hour), messages)
+			base, base.Add(2*time.Hour), messages, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -153,7 +153,7 @@ func TestAssembleGitHubConversation(t *testing.T) {
 			{Author: "other", Body: "second", CreatedAt: base.Add(time.Minute)},
 		}
 		conv := assembleGitHubConversation("owner", "github-issues", "org", "repo", 1, false, "Discussion",
-			base, base.Add(3*time.Minute), messages)
+			base, base.Add(3*time.Minute), messages, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -169,7 +169,7 @@ func TestAssembleGitHubConversation(t *testing.T) {
 			{Author: "other", Body: "msg3", CreatedAt: base.Add(2 * time.Minute)},
 		}
 		conv := assembleGitHubConversation("owner", "github-issues", "org", "repo", 1, false, "Test",
-			base, base.Add(2*time.Minute), messages)
+			base, base.Add(2*time.Minute), messages, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation (case-insensitive match)")
 		}
@@ -196,7 +196,7 @@ func TestAssembleCachedConversation(t *testing.T) {
 				{Author: "owner", Body: "anything else?", CreatedAt: base.Add(3 * time.Hour)},
 			},
 		}
-		conv := assembleCachedConversation("owner", "github-prs", thread)
+		conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -225,7 +225,7 @@ func TestAssembleCachedConversation(t *testing.T) {
 				{Author: "owner", Body: "merging", CreatedAt: base.Add(3 * time.Hour)},
 			},
 		}
-		conv := assembleCachedConversation("owner", "github-prs", thread)
+		conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -252,7 +252,7 @@ func TestAssembleCachedConversation(t *testing.T) {
 				{Author: "owner", Body: "thanks", CreatedAt: base.Add(3 * time.Hour)},
 			},
 		}
-		conv := assembleCachedConversation("owner", "github-prs", thread)
+		conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -281,7 +281,7 @@ func TestAssembleCachedConversation(t *testing.T) {
 				{Author: "owner", Body: "thanks", CreatedAt: base.Add(2 * time.Hour)},
 			},
 		}
-		conv := assembleCachedConversation("owner", "github-prs", thread)
+		conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 		if conv != nil {
 			t.Error("expected nil: PR body should not count toward 2+ owner threshold")
 		}
@@ -297,7 +297,7 @@ func TestAssembleCachedConversation(t *testing.T) {
 				{Author: "owner", Body: "here's a fix", CreatedAt: base.Add(2 * time.Hour)},
 			},
 		}
-		conv := assembleCachedConversation("owner", "github-issues", thread)
+		conv := assembleCachedConversation("owner", "github-issues", thread, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil: issue body should count toward threshold")
 		}
@@ -322,7 +322,7 @@ func TestAssembleCachedConversation(t *testing.T) {
 				{Author: "owner", Body: "review comment 2", CreatedAt: base.Add(3 * time.Hour)},
 			},
 		}
-		conv := assembleCachedConversation("owner", "github-prs", thread)
+		conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 		if conv == nil {
 			t.Fatal("expected non-nil conversation")
 		}
@@ -507,7 +507,7 @@ func TestAssembleCachedConversation_FiltersBots(t *testing.T) {
 			{Author: "owner", Body: "done", CreatedAt: base.Add(5 * time.Hour)},
 		},
 	}
-	conv := assembleCachedConversation("owner", "github-prs", thread)
+	conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 	if conv == nil {
 		t.Fatal("expected non-nil conversation")
 	}
@@ -534,7 +534,7 @@ func TestAssembleCachedConversation_FiltersProwCommands(t *testing.T) {
 			{Author: "owner", Body: "ready for review", CreatedAt: base.Add(5 * time.Hour)},
 		},
 	}
-	conv := assembleCachedConversation("owner", "github-prs", thread)
+	conv := assembleCachedConversation("owner", "github-prs", thread, 0)
 	if conv == nil {
 		t.Fatal("expected non-nil conversation")
 	}

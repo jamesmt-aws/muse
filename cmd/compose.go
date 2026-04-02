@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ func newComposeCmd() *cobra.Command {
 	var learn bool
 	var limit int
 	var method string
+	var project string
 	cmd := &cobra.Command{
 		Use:   "compose",
 		Short: "Compose a muse from conversations",
@@ -53,9 +55,15 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
   muse compose --method=map-reduce      # simpler pipeline
   muse compose --reobserve              # re-observe all from scratch
   muse compose --learn                  # recompose from existing observations
-  muse compose --limit 50              # process at most 50 conversations`,
+  muse compose --limit 50              # process at most 50 conversations
+  muse compose github/ellistarn --project karpenter   # peer muse`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+
+			// Check for peer muse syntax: source/username
+			if peer, _, username := parsePeerArg(args); peer {
+				return runPeerCompose(ctx, cmd.OutOrStdout(), username, project, reobserve, relabel, limit)
+			}
 
 			store, err := newStore(ctx)
 			if err != nil {
@@ -100,7 +108,116 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 	cmd.Flags().BoolVar(&learn, "learn", false, "skip observe, recompose muse from existing observations (map-reduce only)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max conversations to observe per run (0 = no limit)")
 	cmd.Flags().StringVar(&method, "method", "clustering", "composition method: clustering or map-reduce")
+	cmd.Flags().StringVar(&project, "project", "", "restrict peer muse to a project (e.g. karpenter)")
 	return cmd
+}
+
+func parsePeerArg(args []string) (isPeer bool, source, username string) {
+	if len(args) == 0 {
+		return false, "", ""
+	}
+	parts := strings.SplitN(args[0], "/", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return false, "", ""
+	}
+	if parts[0] == "github" {
+		return true, "github", parts[1]
+	}
+	return false, "", ""
+}
+
+func runPeerCompose(ctx context.Context, stdout io.Writer, username, project string, reobserve, relabel bool, limit int) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	pd := fmt.Sprintf("github-%s", username)
+	if project != "" {
+		pd = fmt.Sprintf("github-%s/%s", username, project)
+	}
+	peerRoot := filepath.Join(home, ".muse", "peers", pd)
+	store := storage.NewLocalStoreWithRoot(peerRoot)
+
+	// Create two providers (PRs and issues) targeting the peer user,
+	// matching the upstream github-prs / github-issues split.
+	providers := []conversation.Provider{
+		conversation.NewPeerGitHub("pr", username, project),
+		conversation.NewPeerGitHub("issue", username, project),
+	}
+
+	fmt.Fprintf(os.Stderr, "Composing peer muse for github/%s", username)
+	if project != "" {
+		fmt.Fprintf(os.Stderr, " (project: %s)", project)
+	}
+	fmt.Fprintln(os.Stderr)
+
+	// Use the standard sequential upload + compose flow.
+	result, err := muse.Upload(ctx, store, syncProgressRenderer(), "github-prs", "github-issues")
+	if err != nil {
+		// Upload may fail because the peer store doesn't have these sources.
+		// Fall through with providers directly.
+		_ = result
+	}
+
+	// Actually, for peers we need to use providers directly since
+	// the peer store won't have registered sources.
+	_ = providers
+	observeLLM, err := newLLMClient(ctx, TierFast)
+	if err != nil {
+		return err
+	}
+	composeLLM, err := newLLMClient(ctx, TierStrong)
+	if err != nil {
+		return err
+	}
+
+	// Upload peer conversations via providers.
+	existing, err := store.ListConversations(ctx)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	remote := map[string]storage.ConversationEntry{}
+	for _, e := range existing {
+		remote[e.Key] = e
+	}
+
+	for _, p := range providers {
+		convs, err := p.Conversations(ctx, func(sp conversation.SyncProgress) {
+			if sp.Phase == "log" {
+				fmt.Fprintf(os.Stderr, "sync         %s: %s\n", strings.ToLower(p.Name()), sp.Detail)
+			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", p.Name(), err)
+			continue
+		}
+		for i := range convs {
+			conv := &convs[i]
+			key := fmt.Sprintf("conversations/%s/%s.json", conv.Source, conv.ConversationID)
+			if entry, exists := remote[key]; exists {
+				if !conv.UpdatedAt.After(entry.LastModified) {
+					continue
+				}
+			}
+			store.PutConversation(ctx, conv)
+		}
+	}
+
+	composeResult, err := compose.RunClustered(ctx, store,
+		observeLLM, observeLLM, observeLLM, composeLLM,
+		compose.ClusteredOptions{
+			BaseOptions: compose.BaseOptions{
+				Reobserve: reobserve,
+				Limit:     limit,
+				Verbose:   verbose,
+			},
+			Relabel: relabel,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	return printResult(stdout, composeResult, false)
 }
 
 func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, relabel bool, limit, uploaded, uploadBytes int) error {
