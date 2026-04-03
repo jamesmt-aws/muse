@@ -136,7 +136,7 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 	result, err := compose.RunClustered(ctx, store,
 		observeLLM, // observe
 		observeLLM, // label
-		observeLLM, // summarize
+		composeLLM, // summarize
 		composeLLM, // compose
 		opts,
 	)
