@@ -31,7 +31,7 @@ Active sources have an observation directory and are included when running
 	}
 }
 
-// printSources lists all sources with their active/inactive status.
+// printSources lists all sources with their active/inactive status and counts.
 func printSources(ctx context.Context, w io.Writer, store storage.Store) error {
 	active, err := compose.ListObservationSources(ctx, store)
 	if err != nil {
@@ -42,16 +42,44 @@ func printSources(ctx context.Context, w io.Writer, store storage.Store) error {
 		activeSet[s] = true
 	}
 
+	// Count conversations per source.
+	convCounts := map[string]int{}
+	convEntries, err := store.ListConversations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, e := range convEntries {
+		convCounts[e.Source]++
+	}
+
+	// Count observation items per source.
+	obsCounts, err := compose.CountObservationItems(ctx, store)
+	if err != nil {
+		return err
+	}
+
 	for _, s := range conversation.Sources() {
 		status := "inactive"
 		if activeSet[s.Name] {
 			status = "active"
 		}
+		counts := ""
+		if activeSet[s.Name] {
+			c, o := convCounts[s.Name], obsCounts[s.Name]
+			if c > 0 || o > 0 {
+				counts = fmt.Sprintf("%d conversations  %d observations", c, o)
+			}
+		}
 		tag := ""
 		if s.OptIn {
-			tag = " (opt-in)"
+			tag = "(opt-in)"
 		}
-		fmt.Fprintf(w, "  %-14s %-10s%s\n", s.Name, status, tag)
+		suffix := counts + tag
+		if suffix != "" {
+			suffix = " " + suffix
+		}
+		fmt.Fprintf(w, "  %-16s %-10s%s\n", s.Name, status, suffix)
 	}
+
 	return nil
 }

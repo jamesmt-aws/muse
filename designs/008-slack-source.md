@@ -5,9 +5,10 @@ coding-session sources (Claude Code, OpenCode), Slack conversations are between 
 not between a human and an AI assistant. This is where people argue, decide, persuade, and
 coordinate — the signal is different from what shows up in tool-assisted work.
 
-Slack is opt-in: `muse compose slack`. It requires `MUSE_SLACK_TOKEN` (a SAML cookie file path or
-raw token) and `MUSE_SLACK_WORKSPACE` (for SSO, comma-separated for multiple workspaces). It does
-not run on bare `muse compose`.
+Slack is opt-in: `muse add slack`. It uses `MUSE_SLACK_TOKEN` (a SAML cookie file path or
+raw token) and `MUSE_SLACK_WORKSPACE` (for SSO, comma-separated for multiple workspaces). Once
+added, Slack is remembered across runs. If the env vars are not set at compose time, Slack is
+skipped with a log message — it does not block the rest of the pipeline.
 
 ## Model
 
@@ -53,13 +54,14 @@ The owner's messages map to `user`. All peers map to `assistant`. Every message 
 `@displayname:` for attribution — the downstream extract prompt sees who said what.
 
 This reuses the pipeline's existing `user`/`assistant` contract. The labels are structural, not
-semantic — the `@displayname:` prefix in the content carries the actual attribution. The extract
-prompt looks for reasoning, voice, and awareness in the `[human]` messages, which works for Slack
-because the owner's messages are the ones mapped to `user`.
+semantic — the `@displayname:` prefix in the content carries the actual attribution. The human-source
+extract prompt looks for reasoning, voice, and awareness in the `[human]` messages, which works for
+Slack because the owner's messages are the ones mapped to `user`. (Voice is derived exclusively from
+human-to-human conversations; the AI extract prompt captures only reasoning and awareness.)
 
 For Slack, `extractTurns` accepts 1 user turn (instead of the default 2 for AI conversations).
 A thread where the owner makes one substantive point and three peers respond is valid signal —
-the owner's single statement reveals reasoning and voice.
+the owner's single statement reveals reasoning, awareness, and voice.
 
 ## User display names
 
@@ -123,13 +125,13 @@ without re-fetching.
 
 ## Failure modes
 
-**Missing credentials**: Hard error with actionable message. Since Slack is opt-in, a missing
-`MUSE_SLACK_TOKEN` means the user asked for Slack but didn't configure it — silent nil would be
-confusing.
+**Missing credentials**: Skip with a log message. Since Slack is a remembered preference via
+`muse add`, the env vars may not be set in every environment (e.g. a different machine, a CI
+runner). Missing `MUSE_SLACK_TOKEN` returns `(nil, nil)` — the same contract local sources use
+when their data directory doesn't exist. Present but broken credentials (invalid token, expired
+SSO) are real errors.
 
-**Sync failure**: Hard error. Unlike default providers that fail gracefully (the user didn't ask
-for them), explicitly-requested sources should fail loudly. Partial results from a broken sync
-are worse than no results.
+**Sync failure**: Hard error. Partial results from a broken sync are worse than no results.
 
 **Thread fetch failure**: Individual thread failures are skipped (`continue`). The channel history
 still captures the thread parent message; only the replies are lost. The next incremental sync
@@ -165,7 +167,7 @@ information density.
 
 In AI conversations, 2+ user turns means the user corrected or refined something — that's where
 preferences emerge. In peer conversations, even a single substantive statement reveals reasoning
-and voice. 43% of Slack conversations had only 1 owner message — dropping them would lose nearly
+awareness, and voice. 43% of Slack conversations had only 1 owner message — dropping them would lose nearly
 half the signal.
 
 ### Why `user`/`assistant` roles instead of a new peer role?

@@ -1,17 +1,38 @@
 package inference
 
-import "context"
+import (
+	"context"
+	"errors"
+	"fmt"
+)
 
 // Message is a provider-agnostic conversation message.
 type Message struct {
-	Role    string // "user" or "assistant"
-	Content string
+	Role    string `json:"role"` // "user" or "assistant"
+	Content string `json:"content"`
 }
 
 // Response holds the output from a conversation call.
 type Response struct {
 	Text  string
 	Usage Usage
+}
+
+// TruncatedError indicates the response was cut short by the max token limit.
+// All providers return partial content alongside this error — callers can
+// parse resp.Text even when the error is present.
+type TruncatedError struct {
+	OutputTokens int
+}
+
+func (e *TruncatedError) Error() string {
+	return fmt.Sprintf("response truncated: hit max token limit (%d output tokens)", e.OutputTokens)
+}
+
+// IsTruncated reports whether err is a max-token truncation error.
+func IsTruncated(err error) bool {
+	var te *TruncatedError
+	return errors.As(err, &te)
 }
 
 // Client is the inference interface. Providers implement multi-turn
