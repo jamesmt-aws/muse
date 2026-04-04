@@ -116,14 +116,11 @@ func parsePeerArg(args []string) (isPeer bool, source, username string) {
 	if len(args) == 0 {
 		return false, "", ""
 	}
-	parts := strings.SplitN(args[0], "/", 2)
-	if len(parts) != 2 || parts[1] == "" {
+	src, user, err := parsePeerFlag(args[0])
+	if err != nil {
 		return false, "", ""
 	}
-	if parts[0] == "github" {
-		return true, "github", parts[1]
-	}
-	return false, "", ""
+	return true, src, user
 }
 
 func runPeerCompose(ctx context.Context, stdout io.Writer, username, project string, reobserve, relabel bool, limit int) error {

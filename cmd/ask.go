@@ -96,13 +96,22 @@ func peerDir(peer, project string) string {
 	return dir
 }
 
-func loadPeerDocument(peer, project string) (string, error) {
+// parsePeerFlag validates a "source/username" peer flag and returns the
+// source and username. Currently only "github" is supported as a source.
+func parsePeerFlag(peer string) (source, username string, err error) {
 	parts := strings.SplitN(peer, "/", 2)
 	if len(parts) != 2 || parts[1] == "" {
-		return "", fmt.Errorf("invalid peer format %q (use source/username, e.g. github/ellistarn)", peer)
+		return "", "", fmt.Errorf("invalid peer format %q (use source/username, e.g. github/ellistarn)", peer)
 	}
 	if parts[0] != "github" {
-		return "", fmt.Errorf("unsupported peer source %q (only github is supported)", parts[0])
+		return "", "", fmt.Errorf("unsupported peer source %q (only github is supported)", parts[0])
+	}
+	return parts[0], parts[1], nil
+}
+
+func loadPeerDocument(peer, project string) (string, error) {
+	if _, _, err := parsePeerFlag(peer); err != nil {
+		return "", err
 	}
 
 	home, err := os.UserHomeDir()

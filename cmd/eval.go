@@ -97,9 +97,13 @@ Use --generative to run held-out evaluation against real conversations:
 
 			if generative {
 				if peer == "" {
-					return fmt.Errorf("--generative requires --peer (e.g. --peer ellistarn)")
+					return fmt.Errorf("--generative requires --peer (e.g. --peer github/ellistarn)")
 				}
-				return runGenerativeEval(ctx, peer, project, genLimit)
+				_, username, err := parsePeerFlag(peer)
+				if err != nil {
+					return err
+				}
+				return runGenerativeEval(ctx, username, project, genLimit)
 			}
 			store, err := newStore(ctx)
 			if err != nil {
@@ -180,7 +184,7 @@ Use --generative to run held-out evaluation against real conversations:
 	}
 	cmd.Flags().StringVar(&evalDir, "dir", "", "directory of additional .md question files")
 	cmd.Flags().BoolVar(&generative, "generative", false, "run held-out generative evaluation against real conversations")
-	cmd.Flags().StringVar(&peer, "peer", "", "peer username for generative eval (e.g. ellistarn)")
+	cmd.Flags().StringVar(&peer, "peer", "", "peer muse to evaluate (e.g. github/ellistarn)")
 	cmd.Flags().StringVar(&project, "project", "", "project scope for generative eval")
 	cmd.Flags().IntVar(&genLimit, "cases", 0, "max test cases for generative eval (0 = auto)")
 	return cmd

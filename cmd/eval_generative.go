@@ -163,7 +163,7 @@ func runGenerativeEval(ctx context.Context, peer, project string, limit int) err
 		return fmt.Errorf("no usable test cases found")
 	}
 
-	fmt.Fprintf(os.Stderr, "generative eval  %d cases  peer=%s/%s\n\n", len(cases), peer, project)
+	fmt.Fprintf(os.Stderr, "generative eval  %d cases  peer=github/%s/%s\n\n", len(cases), peer, project)
 
 	// Run evaluation
 	llm, err := newLLMClient(ctx, TierStrong)
