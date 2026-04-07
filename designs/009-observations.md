@@ -38,24 +38,34 @@ When the owner says "on line 12, be more specific," compression preserves the di
 strips line 12. The observation captures a general preference instead of a specific
 transformation.
 
-### Approaches attempted and abandoned
+### Approaches attempted and abandoned after experiments
 
 **A: Adaptive compression.** Scale the assistant text limit by owner message length
-(500-2000 chars). More context diluted signal: 17k chars produced 0 observations while
-13k produced 5. The extra context made the conversation look more routine.
+(500-2000 chars). More context diluted signal in local experiments: 17k chars
+produced 0 observations while 13k produced 5. The extra context made the
+conversation look less interesting to muse.
 
 **B: Prompt-driven extraction.** Ask the observe prompt for transformations, not just
 principles. Made the LLM more cautious, producing fewer observations.
 
 **C: Context-aware prompting.** Ask the LLM to reason about what context each response
-requires. Same regression as B.
+requires. Same performance regression relative to mainline as B.
 
-**D: Mechanical turn filtering.** Remove confirmations and short directives before
-observe. Insufficient: many low-signal turns survive word-count and pattern filters.
+**D: Word-count and pattern filters.** Remove confirmations and short directives before
+observe by matching known low-signal phrases and applying a minimum word count. Insufficient:
+many low-signal turns survive the patterns, and the turns that are removed aren't the ones
+causing observe to fail.
 
-**E: LLM triage + full conversation.** Cheap LLM call classifies turns as reasoning vs
+**E: LLM triage + compressed conversation.** Cheap LLM call classifies turns as reasoning vs
 housekeeping, then pass triaged turns through the standard compression pipeline. Triage
-works well, but observe still returns NONE on the compressed triaged conversation.
+works as a classifier — it correctly identifies which turns contain reasoning. But observe
+still returns NONE on the compressed triaged conversation. The triaged output still includes
+compressed assistant text (~500 chars per turn), and that's enough to trigger the same
+failure. We don't have a proven mechanism for why assistant text in reasoning turns kills
+observe. Possible explanations: pure volume (11 triaged turns × 500 chars of assistant text),
+attention shifting to the assistant's framing instead of the owner's reasoning, or mixed-role
+presentation changing how the model processes the input. We tested the endpoint (owner-only
+works, mixed doesn't) but not the mechanism.
 
 ### What we found: context rot
 
