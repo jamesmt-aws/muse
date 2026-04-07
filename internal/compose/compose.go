@@ -67,9 +67,13 @@ const (
 type ObserveMode string
 
 const (
-	// ObserveWindowed uses sliding-window observation (default).
-	ObserveWindowed ObserveMode = ""
-	// ObserveTriageOwnerOnly uses the triage + owner-only path.
+	// ObserveMultiZoom runs both windowed (local) and triage+owner-only (global)
+	// passes, merges the observations. Each zoom level catches signal the other
+	// misses. This is the default.
+	ObserveMultiZoom ObserveMode = ""
+	// ObserveWindowed uses sliding-window observation only.
+	ObserveWindowed ObserveMode = "windowed"
+	// ObserveTriageOwnerOnly uses the triage + owner-only path only.
 	ObserveTriageOwnerOnly ObserveMode = "triage-owner-only"
 	// ObserveFullConversation compresses the full conversation and observes
 	// in chunks. This is the original path that exhibits context rot on long
@@ -87,6 +91,8 @@ type BaseOptions struct {
 	Verbose bool
 	// Context controls the compression strategy for assistant text.
 	Context ContextStrategy
+	// Observe controls the observation strategy for large conversations.
+	Observe ObserveMode
 }
 
 // Options configures a map-reduce compose run.
@@ -184,7 +190,7 @@ func Run(ctx context.Context, store storage.Store, observeLLM, learnLLM inferenc
 					return
 				}
 				start := time.Now()
-				obs, usage, err := observeConversation(ctx, observeLLM, conv)
+				obs, usage, err := observeConversation(ctx, observeLLM, conv, opts.Observe)
 				n := completed.Add(1)
 				if err != nil {
 					mu.Lock()
@@ -314,8 +320,8 @@ type turn struct {
 	humanContent     string // human's message
 }
 
-func observeConversation(ctx context.Context, client inference.Client, conv *conversation.Conversation) (string, inference.Usage, error) {
-	refined, usage, err := observeAndRefine(ctx, client, conv, false, ContextDefault, ObserveWindowed)
+func observeConversation(ctx context.Context, client inference.Client, conv *conversation.Conversation, mode ObserveMode) (string, inference.Usage, error) {
+	refined, usage, err := observeAndRefine(ctx, client, conv, false, ContextDefault, mode)
 	if err != nil {
 		return "", usage, err
 	}

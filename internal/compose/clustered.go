@@ -356,7 +356,8 @@ func runObserve(
 	// Compute prompt chain hash for fingerprinting. Includes window parameters
 	// so changing the observation strategy invalidates cached observations.
 	promptHash := Fingerprint(prompts.Observe, prompts.ObserveHuman, prompts.Refine,
-		fmt.Sprintf("window:%d:%d", windowSize, windowStride))
+		fmt.Sprintf("window:%d:%d", windowSize, windowStride),
+		fmt.Sprintf("mode:%s", opts.Observe))
 
 	// Determine which conversations need (re)observation
 	var pending []storage.ConversationEntry
@@ -433,7 +434,7 @@ func runObserve(
 				convBytes := conversationDataSize(conv)
 
 				start := time.Now()
-				items, u, err := observeAndParse(ctx, llm, conv, opts.Verbose, opts.Context)
+				items, u, err := observeAndParse(ctx, llm, conv, opts.Verbose, opts.Context, opts.Observe)
 				n := counter.Add(1)
 				if err != nil {
 					return fmt.Errorf("observe %s: %w", entry.Key, err)
@@ -497,6 +498,23 @@ func conversationDataSize(conv *conversation.Conversation) int {
 // ObserveForTestVerbose runs the full observe pipeline on a single conversation,
 // returning the raw observe output and parsed observations.
 func ObserveForTestVerbose(ctx context.Context, client inference.Client, conv *conversation.Conversation, ctxStrategy ContextStrategy, mode ObserveMode) (string, []Observation, inference.Usage, error) {
+	// Multi-zoom merges at the observation level, not the raw text level.
+	if mode == ObserveMultiZoom {
+		obs, usage, err := observeMultiZoom(ctx, client, conv, true, ctxStrategy)
+		if err != nil {
+			return "", nil, usage, err
+		}
+		// Reconstruct raw text for display
+		var raw strings.Builder
+		for _, o := range obs {
+			if o.Quote != "" {
+				fmt.Fprintf(&raw, "Quote: %s\n", o.Quote)
+			}
+			fmt.Fprintf(&raw, "Observation: %s\n\n", o.Text)
+		}
+		return strings.TrimSpace(raw.String()), obs, usage, nil
+	}
+
 	raw, usage, err := observeAndRefine(ctx, client, conv, true, ctxStrategy, mode)
 	if err != nil {
 		return "", nil, usage, err
@@ -521,19 +539,121 @@ func ObserveForTestVerbose(ctx context.Context, client inference.Client, conv *c
 // exceeds the context window, mechanical compression is applied as a fallback:
 // code blocks are stripped, tool output is collapsed to [tool: name] markers,
 // and long assistant messages are truncated.
-func observeAndParse(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, ctxStrategy ContextStrategy) ([]Observation, inference.Usage, error) {
-	refined, usage, err := observeAndRefine(ctx, client, conv, verbose, ctxStrategy, ObserveWindowed)
+func observeAndParse(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, ctxStrategy ContextStrategy, mode ObserveMode) ([]Observation, inference.Usage, error) {
+	if mode == ObserveMultiZoom {
+		return observeMultiZoom(ctx, client, conv, verbose, ctxStrategy)
+	}
+
+	refined, usage, err := observeAndRefine(ctx, client, conv, verbose, ctxStrategy, mode)
 	if err != nil {
 		return nil, usage, err
 	}
+	return parseAndFilter(refined, usage, verbose)
+}
+
+// observeMultiZoom runs both windowed (local) and triage+owner-only (global)
+// passes on the same conversation and merges the observations.
+func observeMultiZoom(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, ctxStrategy ContextStrategy) ([]Observation, inference.Usage, error) {
+	turns := extractTurns(conv)
+	// Only run both zoom levels on large conversations. Small ones get a single pass.
+	if len(turns) <= 10 {
+		refined, usage, err := observeAndRefine(ctx, client, conv, verbose, ctxStrategy, ObserveWindowed)
+		if err != nil {
+			return nil, usage, err
+		}
+		return parseAndFilter(refined, usage, verbose)
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "    multi-zoom: running local (windowed) + global (triage) passes\n")
+	}
+
+	// Local pass: windowed
+	localRaw, localUsage, localErr := observeAndRefine(ctx, client, conv, verbose, ctxStrategy, ObserveWindowed)
+	if localErr != nil {
+		return nil, localUsage, localErr
+	}
+	localObs, _, _ := parseAndFilter(localRaw, inference.Usage{}, false)
+
+	// Global pass: triage + owner-only
+	globalRaw, globalUsage, globalErr := observeAndRefine(ctx, client, conv, verbose, ctxStrategy, ObserveTriageOwnerOnly)
+	totalUsage := localUsage.Add(globalUsage)
+	if globalErr != nil {
+		// Global pass failure is non-fatal — return local observations
+		if verbose {
+			fmt.Fprintf(os.Stderr, "    multi-zoom: global pass failed (%v), using local only\n", globalErr)
+		}
+		return localObs, totalUsage, nil
+	}
+	globalObs, _, _ := parseAndFilter(globalRaw, inference.Usage{}, false)
+
+	// Merge and deduplicate
+	merged := deduplicateObservations(localObs, globalObs)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "    multi-zoom: %d local + %d global → %d merged\n",
+			len(localObs), len(globalObs), len(merged))
+	}
+	return merged, totalUsage, nil
+}
+
+// deduplicateObservations merges two observation sets, dropping duplicates
+// where one observation's text contains the other's (after normalization).
+func deduplicateObservations(a, b []Observation) []Observation {
+	all := make([]Observation, 0, len(a)+len(b))
+	all = append(all, a...)
+	all = append(all, b...)
+
+	type normObs struct {
+		obs  Observation
+		norm string
+	}
+	var items []normObs
+	for _, o := range all {
+		items = append(items, normObs{obs: o, norm: strings.ToLower(strings.TrimSpace(o.Text))})
+	}
+
+	keep := make([]bool, len(items))
+	for i := range keep {
+		keep[i] = true
+	}
+	for i := 0; i < len(items); i++ {
+		if !keep[i] {
+			continue
+		}
+		for j := i + 1; j < len(items); j++ {
+			if !keep[j] {
+				continue
+			}
+			if items[i].norm == items[j].norm {
+				keep[j] = false
+				continue
+			}
+			if strings.Contains(items[i].norm, items[j].norm) {
+				keep[j] = false
+			} else if strings.Contains(items[j].norm, items[i].norm) {
+				keep[i] = false
+				break
+			}
+		}
+	}
+
+	var result []Observation
+	for i, item := range items {
+		if keep[i] {
+			result = append(result, item.obs)
+		}
+	}
+	return result
+}
+
+// parseAndFilter parses raw observe output into discrete observations,
+// filtering irrelevant items.
+func parseAndFilter(refined string, usage inference.Usage, verbose bool) ([]Observation, inference.Usage, error) {
 	if refined == "" {
 		return nil, usage, nil
 	}
-
-	// Parse refined output into discrete items.
 	items := parseObservationItems(refined)
 
-	// Filter irrelevant items: empty responses, LLM meta-commentary, placeholder tokens
 	var relevant []Observation
 	var irrelevant []Observation
 	for _, item := range items {

@@ -63,6 +63,7 @@ func runEvalContext(ctx context.Context, convID string) error {
 		ctx  compose.ContextStrategy
 		mode compose.ObserveMode
 	}{
+		{"multi-zoom (default)", compose.ContextDefault, compose.ObserveMultiZoom},
 		{"windowed", compose.ContextDefault, compose.ObserveWindowed},
 		{"triage-owner-only", compose.ContextDefault, compose.ObserveTriageOwnerOnly},
 		{"full-conversation (baseline)", compose.ContextDefault, compose.ObserveFullConversation},

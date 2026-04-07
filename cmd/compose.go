@@ -26,6 +26,7 @@ func newComposeCmd() *cobra.Command {
 	var limit int
 	var method string
 	var context string
+	var observeMode string
 	cmd := &cobra.Command{
 		Use:   "compose",
 		Short: "Compose a muse from conversations",
@@ -86,9 +87,11 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 				uploadBytes = result.Bytes
 			}
 
+			mode := compose.ObserveMode(observeMode)
+
 			switch method {
 			case "clustering":
-				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, reobserve, relabel, compose.ContextStrategy(context), limit, uploaded, uploadBytes)
+				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, reobserve, relabel, compose.ContextStrategy(context), mode, limit, uploaded, uploadBytes)
 			case "map-reduce":
 				return runMapReduceCompose(ctx, cmd.OutOrStdout(), store, reobserve, learn, limit)
 			default:
@@ -102,10 +105,11 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 	cmd.Flags().IntVar(&limit, "limit", 0, "max conversations to observe per run (0 = no limit)")
 	cmd.Flags().StringVar(&method, "method", "clustering", "composition method: clustering or map-reduce")
 	cmd.Flags().StringVar(&context, "context", "", "compression context strategy: '' (default 500 chars) or 'adaptive' (scale by owner message length)")
+	cmd.Flags().StringVar(&observeMode, "observe-mode", "", "observation strategy for large conversations: '' (multi-zoom, default), 'windowed', 'triage-owner-only', 'full-conversation'")
 	return cmd
 }
 
-func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, relabel bool, ctxStrategy compose.ContextStrategy, limit, uploaded, uploadBytes int) error {
+func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, relabel bool, ctxStrategy compose.ContextStrategy, mode compose.ObserveMode, limit, uploaded, uploadBytes int) error {
 	observeLLM, err := newLLMClient(ctx, TierFast)
 	if err != nil {
 		return err
@@ -126,6 +130,7 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 				Limit:     limit,
 				Verbose:   verbose,
 				Context:   ctxStrategy,
+				Observe:   mode,
 			},
 			Relabel:     relabel,
 			Uploaded:    uploaded,
