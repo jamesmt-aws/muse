@@ -57,17 +57,24 @@ observe. Insufficient: many low-signal turns survive word-count and pattern filt
 housekeeping, then pass triaged turns through the standard compression pipeline. Triage
 works well, but observe still returns NONE on the compressed triaged conversation.
 
-### What we found
+### What we found: context rot
 
-The observe prompt produces strong observations from concentrated owner input: 6 curated
-owner messages produce 5-6 observations with specific quotes and reasoning. The same
-messages embedded in a full compressed conversation (with assistant text, tool markers,
-and mechanical turns) produce NONE consistently.
+Long conversations exhibit context rot. Early turns carry design decisions, corrections,
+and reasoning. Later turns accumulate mechanical work: git operations, CI checks,
+formatting fixes. The signal-to-noise ratio degrades as the conversation grows.
 
-The problem is not context preservation, compression limits, or prompt wording. It is
-volume. The observe prompt gives up when there are too many messages to evaluate,
-regardless of their quality. Assistant context makes this worse by making every
-conversation look like routine agent direction.
+The observe prompt reads through the compressed conversation sequentially. When reasoning
+turns from early in the conversation are followed by pages of mechanical turns, the LLM's
+attention drifts to the recent, mechanical content. Reasoning that is still in the context
+window gets washed out by surrounding noise. The result is NONE for the whole conversation.
+
+This is a local signal problem, not a global ratio problem. Turn 4 is a design decision
+regardless of what turns 15-27 contain. But observing the full conversation forces the
+LLM to evaluate turn 4 in the context of everything that came after it.
+
+The triage + owner-only approach works around this by stripping noise before observe sees
+it. A more fundamental fix would observe in local windows so that no turn is ever evaluated
+in the context of distant mechanical turns. See reboot.md for next steps.
 
 ### Solution: triage + owner-only observe
 
