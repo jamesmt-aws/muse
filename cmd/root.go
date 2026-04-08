@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -61,6 +62,7 @@ Run "muse listen --help" for MCP server configuration.`,
 	cmd.AddCommand(newEvalCmd())
 	cmd.AddCommand(newAddCmd())
 	cmd.AddCommand(newRemoveCmd())
+	cmd.AddCommand(newImportCmd())
 	return cmd
 }
 
@@ -75,6 +77,15 @@ func newStore(ctx context.Context) (storage.Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// sessionsDir returns the path to ~/.muse/sessions/ for session persistence.
+func sessionsDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".muse", "sessions"), nil
 }
 
 // loadDocument loads the muse.md content from storage. Returns empty string on first run.
