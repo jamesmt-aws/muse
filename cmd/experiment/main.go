@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ellistarn/muse/internal/bedrock"
 	"github.com/ellistarn/muse/internal/compose"
@@ -34,8 +35,17 @@ func main() {
 	}
 	ctx := context.Background()
 
-	os.Setenv("MUSE_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
-	client, err := bedrock.NewClient(ctx, "claude-haiku")
+	model := "claude-haiku"
+	modelID := "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+	if len(args) > 0 && args[0] == "--opus" {
+		model = "claude-opus"
+		modelID = ""
+		args = args[1:]
+	}
+	if modelID != "" {
+		os.Setenv("MUSE_MODEL", modelID)
+	}
+	client, err := bedrock.NewClient(ctx, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bedrock client: %v\n", err)
 		os.Exit(1)
@@ -113,7 +123,59 @@ func runEssayExperiment(ctx context.Context, client inference.Client, paths []st
 			}
 			printObserveResult(raw2, usage2)
 		}
+
+		// Windowed: slide through the essay in overlapping chunks
+		fmt.Printf("\n--- Strategy 3: WINDOWED (overlapping chunks) ---\n")
+		chunks := buildEssayWindows(paragraphs, 5, 2) // 5 paragraphs per window, stride 2
+		fmt.Printf("  Windows: %d (size 5 paragraphs, stride 2)\n", len(chunks))
+
+		var allWindowObs []string
+		var totalWindowUsage inference.Usage
+		for i, chunk := range chunks {
+			input := strings.Join(chunk, "\n\n")
+			start := time.Now()
+			obs, usage, err := inference.Converse(ctx, client, prompts.ObserveEssay, input, inference.WithMaxTokens(4096))
+			totalWindowUsage.InputTokens += usage.InputTokens
+			totalWindowUsage.OutputTokens += usage.OutputTokens
+			fmt.Fprintf(os.Stderr, "      window[%d/%d] %d paragraphs, %d chars → %d chars (%s)\n",
+				i+1, len(chunks), len(chunk), len(input), len(obs), time.Since(start).Round(time.Millisecond))
+			if err != nil && obs == "" {
+				fmt.Fprintf(os.Stderr, "  window error: %v\n", err)
+				continue
+			}
+			trimmed := strings.TrimSpace(obs)
+			if trimmed != "" && trimmed != "NONE" {
+				allWindowObs = append(allWindowObs, trimmed)
+			}
+		}
+
+		if len(allWindowObs) == 0 {
+			fmt.Printf("  Observations: 0\n  Result: NONE\n")
+		} else {
+			combined := strings.Join(allWindowObs, "\n\n")
+			fmt.Printf("  Observations: %d\n", countObservations(combined))
+			fmt.Printf("  Tokens: %dk in / %dk out\n",
+				totalWindowUsage.InputTokens/1000, totalWindowUsage.OutputTokens/1000)
+			fmt.Printf("\n%s\n", combined)
+		}
 	}
+}
+
+// buildEssayWindows splits paragraphs into overlapping windows.
+func buildEssayWindows(paragraphs []string, size, stride int) [][]string {
+	var windows [][]string
+	for start := 0; start < len(paragraphs); start += stride {
+		end := start + size
+		if end > len(paragraphs) {
+			end = len(paragraphs)
+		}
+		if start > 0 && end == len(paragraphs) && end-start < size/2 {
+			// Tiny tail, extend the previous window instead
+			break
+		}
+		windows = append(windows, paragraphs[start:end])
+	}
+	return windows
 }
 
 func printObserveResult(raw string, usage inference.Usage) {
