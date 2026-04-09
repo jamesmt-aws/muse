@@ -52,3 +52,9 @@ var Thesis string
 
 //go:embed triage.md
 var Triage string
+
+//go:embed observe-essay.md
+var ObserveEssay string
+
+//go:embed observe-labeled.md
+var ObserveLabeled string
