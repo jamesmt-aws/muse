@@ -343,5 +343,33 @@ func runConversationExperiment(ctx context.Context, client inference.Client, pat
 		} else {
 			fmt.Printf("\n%s\n", raw5)
 		}
+
+		// Strategy 6: Small windows with assistant (4 turns, context-size matched)
+		fmt.Printf("\n--- Strategy 6: WINDOWED SMALL (4-turn with assistant) ---\n")
+		raw6, obs6, usage6, err := compose.ObserveWindowedSmall(ctx, client, &conv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  WINDOWED SMALL error: %v\n", err)
+		}
+		fmt.Printf("  Observations: %d\n", len(obs6))
+		fmt.Printf("  Tokens: %dk in / %dk out\n", usage6.InputTokens/1000, usage6.OutputTokens/1000)
+		if raw6 == "" || strings.TrimSpace(raw6) == "NONE" {
+			fmt.Printf("  Result: NONE\n")
+		} else {
+			fmt.Printf("\n%s\n", raw6)
+		}
+
+		// Strategy 7: Large windows owner-only (16 turns, context-size matched)
+		fmt.Printf("\n--- Strategy 7: WINDOWED OWNER-ONLY LARGE (16-turn) ---\n")
+		raw7, obs7, usage7, err := compose.ObserveWindowedOwnerOnlyLarge(ctx, client, &conv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  WINDOWED OWNER-ONLY LARGE error: %v\n", err)
+		}
+		fmt.Printf("  Observations: %d\n", len(obs7))
+		fmt.Printf("  Tokens: %dk in / %dk out\n", usage7.InputTokens/1000, usage7.OutputTokens/1000)
+		if raw7 == "" || strings.TrimSpace(raw7) == "NONE" {
+			fmt.Printf("  Result: NONE\n")
+		} else {
+			fmt.Printf("\n%s\n", raw7)
+		}
 	}
 }
