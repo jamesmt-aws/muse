@@ -111,16 +111,25 @@ const (
 // otherwise bedrock (uses standard AWS credential chain).
 func newLLMClient(ctx context.Context, tier string) (inference.Client, error) {
 	provider := detectProvider()
+	var client inference.Client
+	var err error
 	switch provider {
 	case "anthropic":
-		return anthropic.NewClient(ctx, anthropicModel(tier))
+		client, err = anthropic.NewClient(ctx, anthropicModel(tier))
 	case "openai":
-		return museOpenAI.NewClient(ctx, openaiModel(tier))
+		client, err = museOpenAI.NewClient(ctx, openaiModel(tier))
 	case "bedrock":
-		return bedrock.NewClient(ctx, bedrockModel(tier))
+		client, err = bedrock.NewClient(ctx, bedrockModel(tier))
 	default:
 		return nil, fmt.Errorf("unknown MUSE_PROVIDER %q (use 'anthropic', 'openai', or 'bedrock')", provider)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// Wrap with disk cache. Cache dir is under the muse home directory.
+	home, _ := os.UserHomeDir()
+	cacheDir := filepath.Join(home, ".muse", "cache", "llm")
+	return inference.NewCachedClient(client, cacheDir), nil
 }
 
 // detectProvider returns the provider from MUSE_PROVIDER, or auto-detects
