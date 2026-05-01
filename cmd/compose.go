@@ -25,6 +25,7 @@ func newComposeCmd() *cobra.Command {
 	var learn bool
 	var limit int
 	var method string
+	var extract string
 	cmd := &cobra.Command{
 		Use:   "compose [source...]",
 		Short: "Compose a muse from conversations",
@@ -85,7 +86,7 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 
 			switch method {
 			case "clustering":
-				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, sources, reobserve, relabel, limit, uploaded, uploadBytes)
+				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, sources, reobserve, relabel, extract, limit, uploaded, uploadBytes)
 			case "map-reduce":
 				return runMapReduceCompose(ctx, cmd.OutOrStdout(), store, sources, reobserve, learn, limit)
 			default:
@@ -98,10 +99,11 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 	cmd.Flags().BoolVar(&learn, "learn", false, "skip observe, recompose muse from existing observations (map-reduce only)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "max conversations to observe per run (0 = no limit)")
 	cmd.Flags().StringVar(&method, "method", "clustering", "composition method: clustering or map-reduce")
+	cmd.Flags().StringVar(&extract, "extract", "", "extraction strategy: '' (default), 'woo' (windowed owner-only), 'adaptive' (woo-first with fallback)")
 	return cmd
 }
 
-func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, sources []string, reobserve, relabel bool, limit, uploaded, uploadBytes int) error {
+func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, sources []string, reobserve, relabel bool, extract string, limit, uploaded, uploadBytes int) error {
 	observeLLM, err := newLLMClient(ctx, TierObserve)
 	if err != nil {
 		return err
@@ -122,6 +124,7 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 				Limit:     limit,
 				Sources:   sources,
 				Verbose:   verbose,
+				Extract:   extract,
 			},
 			Relabel:     relabel,
 			Uploaded:    uploaded,

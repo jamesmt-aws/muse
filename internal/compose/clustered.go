@@ -323,8 +323,13 @@ func runObserve(
 	sort.Strings(sources)
 	discovered := len(entries)
 
-	// Compute prompt chain hash for fingerprinting
-	promptHash := Fingerprint(prompts.Extract, prompts.Refine)
+	// Compute prompt chain hash for fingerprinting. The extract strategy is
+	// included when set so switching strategies invalidates the cache.
+	hashParts := []string{prompts.Extract, prompts.Refine}
+	if opts.Extract != "" {
+		hashParts = append(hashParts, opts.Extract)
+	}
+	promptHash := Fingerprint(hashParts...)
 
 	// Determine which conversations need (re)observation
 	var pending []storage.ConversationEntry
@@ -401,7 +406,7 @@ func runObserve(
 				convBytes := conversationDataSize(conv)
 
 				start := time.Now()
-				items, u, err := extractObservations(ctx, llm, conv, opts.Verbose)
+				items, u, err := extractObservations(ctx, llm, conv, opts.Verbose, opts.Extract)
 				n := counter.Add(1)
 				if err != nil {
 					return fmt.Errorf("observe %s: %w", entry.Key, err)
@@ -465,7 +470,17 @@ func conversationDataSize(conv *conversation.Conversation) int {
 // exceeds the context window, mechanical compression is applied as a fallback:
 // code blocks are stripped, tool output is collapsed to [tool: name] markers,
 // and long assistant messages are truncated.
-func extractObservations(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
+func extractObservations(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, strategy string) ([]Observation, inference.Usage, error) {
+	switch strategy {
+	case "woo":
+		return extractWoo(ctx, client, conv, verbose)
+	case "adaptive":
+		return extractAdaptive(ctx, client, conv, verbose)
+	}
+	return extractDefault(ctx, client, conv, verbose)
+}
+
+func extractDefault(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
 	refined, usage, err := extractAndRefine(ctx, client, conv, verbose)
 	if err != nil {
 		return nil, usage, err
@@ -473,31 +488,7 @@ func extractObservations(ctx context.Context, client inference.Client, conv *con
 	if refined == "" {
 		return nil, usage, nil
 	}
-
-	// Parse refined output into discrete items.
-	items := parseObservationItems(refined)
-
-	// Filter irrelevant items: empty responses, LLM meta-commentary, placeholder tokens
-	var relevant []Observation
-	var irrelevant []Observation
-	for _, item := range items {
-		if isRelevant(item.Text) {
-			relevant = append(relevant, item)
-		} else {
-			irrelevant = append(irrelevant, item)
-		}
-	}
-	if len(irrelevant) > 0 && verbose {
-		fmt.Fprintf(os.Stderr, "    filtered %d irrelevant observations:\n", len(irrelevant))
-		for _, item := range irrelevant {
-			text := item.Text
-			if len(text) > 100 {
-				text = text[:100] + "..."
-			}
-			fmt.Fprintf(os.Stderr, "      - %s\n", text)
-		}
-	}
-	return relevant, usage, nil
+	return filterObservations(refined, verbose), usage, nil
 }
 
 // extractAndRefine is the shared core of the observation pipeline. It extracts
@@ -555,6 +546,247 @@ func extractAndRefine(ctx context.Context, client inference.Client, conv *conver
 		return "", totalUsage, nil
 	}
 	return refined, totalUsage, nil
+}
+
+// filterObservations parses and filters LLM output into discrete observations.
+func filterObservations(text string, verbose bool) []Observation {
+	items := parseObservationItems(text)
+	var relevant []Observation
+	var irrelevant []Observation
+	for _, item := range items {
+		if isRelevant(item.Text) {
+			relevant = append(relevant, item)
+		} else {
+			irrelevant = append(irrelevant, item)
+		}
+	}
+	if len(irrelevant) > 0 && verbose {
+		fmt.Fprintf(os.Stderr, "    filtered %d irrelevant observations:\n", len(irrelevant))
+		for _, item := range irrelevant {
+			text := item.Text
+			if len(text) > 100 {
+				text = text[:100] + "..."
+			}
+			fmt.Fprintf(os.Stderr, "      - %s\n", text)
+		}
+	}
+	return relevant
+}
+
+// Window parameters for windowed observation. Each window is small enough that
+// local signal survives without being washed out by distant mechanical turns.
+// Adjacent windows overlap so multi-turn reasoning arcs aren't split.
+const (
+	windowSize   = 8 // turns per window
+	windowStride = 4 // advance between windows
+)
+
+// extractWoo runs windowed owner-only extraction. It slides an 8-turn window
+// across the conversation, strips assistant text from each window, and extracts
+// from each window independently. Deduplicates across overlapping windows, then
+// refines.
+func extractWoo(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
+	turns := extractTurns(conv)
+	if len(turns) == 0 {
+		return nil, inference.Usage{}, nil
+	}
+
+	windows := buildWindows(turns, windowSize, windowStride)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "    woo: %d turns → %d windows\n", len(turns), len(windows))
+	}
+
+	var totalUsage inference.Usage
+	var allCandidates []string
+
+	for i, w := range windows {
+		var b strings.Builder
+		for _, t := range w {
+			fmt.Fprintf(&b, "[human]: %s\n\n", t.humanContent)
+		}
+		input := b.String()
+
+		start := time.Now()
+		obs, usage, err := inference.Converse(ctx, client, prompts.Extract, input, inference.WithMaxTokens(4096))
+		totalUsage = totalUsage.Add(usage)
+		if verbose {
+			fmt.Fprintf(os.Stderr, "      window[%d/%d] %d turns, %d chars → %d chars (%s)\n",
+				i+1, len(windows), len(w), len(input), len(obs), time.Since(start).Round(time.Millisecond))
+		}
+		if err != nil && obs == "" {
+			return nil, totalUsage, err
+		}
+		if obs != "" && !isEmpty(obs) {
+			allCandidates = append(allCandidates, obs)
+		}
+	}
+
+	if len(allCandidates) == 0 {
+		return nil, totalUsage, nil
+	}
+
+	candidates := deduplicateObservationText(strings.Join(allCandidates, "\n\n"))
+	refined, usage, err := inference.Converse(ctx, client, prompts.Refine, candidates, inference.WithMaxTokens(4096))
+	totalUsage = totalUsage.Add(usage)
+	if err != nil && refined == "" {
+		return nil, totalUsage, err
+	}
+	if isEmpty(refined) {
+		return nil, totalUsage, nil
+	}
+	return filterObservations(refined, verbose), totalUsage, nil
+}
+
+// extractAdaptive tries woo (owner-only) first on each window. If woo returns
+// NONE, it falls back to the default method (with assistant text) on the same
+// window. At most two calls per window.
+func extractAdaptive(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
+	turns := extractTurns(conv)
+	if len(turns) == 0 {
+		return nil, inference.Usage{}, nil
+	}
+
+	windows := buildWindows(turns, windowSize, windowStride)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "    adaptive: %d turns → %d windows\n", len(turns), len(windows))
+	}
+
+	var totalUsage inference.Usage
+	var allCandidates []string
+
+	for i, w := range windows {
+		// Build both inputs upfront
+		var wooB strings.Builder
+		for _, t := range w {
+			fmt.Fprintf(&wooB, "[human]: %s\n\n", t.humanContent)
+		}
+		wooInput := wooB.String()
+
+		chunks := compressConversation(w)
+		defaultInput := strings.Join(chunks, "\n")
+
+		attempts := []struct {
+			input, method string
+		}{
+			{wooInput, "woo"},
+			{defaultInput, "default"},
+		}
+
+		start := time.Now()
+		for j, a := range attempts {
+			obs, usage, err := inference.Converse(ctx, client, prompts.Extract, a.input, inference.WithMaxTokens(4096))
+			totalUsage = totalUsage.Add(usage)
+			if err != nil && obs == "" {
+				return nil, totalUsage, err
+			}
+			if obs != "" && !isEmpty(obs) {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "      window[%d/%d] %s → %d chars (%s)\n",
+						i+1, len(windows), a.method, len(obs), time.Since(start).Round(time.Millisecond))
+				}
+				allCandidates = append(allCandidates, obs)
+				break
+			}
+			if j == 0 && verbose {
+				fmt.Fprintf(os.Stderr, "      window[%d/%d] woo → NONE, trying default\n", i+1, len(windows))
+			}
+		}
+	}
+
+	if len(allCandidates) == 0 {
+		return nil, totalUsage, nil
+	}
+
+	candidates := deduplicateObservationText(strings.Join(allCandidates, "\n\n"))
+	refined, usage, err := inference.Converse(ctx, client, prompts.Refine, candidates, inference.WithMaxTokens(4096))
+	totalUsage = totalUsage.Add(usage)
+	if err != nil && refined == "" {
+		return nil, totalUsage, err
+	}
+	if isEmpty(refined) {
+		return nil, totalUsage, nil
+	}
+	return filterObservations(refined, verbose), totalUsage, nil
+}
+
+// buildWindows splits turns into overlapping windows of the given size and stride.
+// The last window is extended to avoid a tiny tail.
+func buildWindows(turns []turn, size, stride int) [][]turn {
+	if len(turns) <= size {
+		return [][]turn{turns}
+	}
+	var windows [][]turn
+	for start := 0; start < len(turns); start += stride {
+		end := start + size
+		if end > len(turns) {
+			end = len(turns)
+		}
+		if len(turns)-end < stride {
+			end = len(turns)
+		}
+		windows = append(windows, turns[start:end])
+		if end == len(turns) {
+			break
+		}
+	}
+	return windows
+}
+
+// deduplicateObservationText removes duplicate observations from raw LLM output
+// across overlapping windows. Two observations are duplicates if their normalized
+// text is identical or one contains the other.
+func deduplicateObservationText(text string) string {
+	items := parseObservationItems(text)
+	if len(items) == 0 {
+		return text
+	}
+
+	type normalizedObs struct {
+		original Observation
+		norm     string
+	}
+	var normalized []normalizedObs
+	for _, item := range items {
+		normalized = append(normalized, normalizedObs{
+			original: item,
+			norm:     strings.ToLower(strings.TrimSpace(item.Text)),
+		})
+	}
+
+	keep := make([]bool, len(normalized))
+	for i := range keep {
+		keep[i] = true
+	}
+	for i := 0; i < len(normalized); i++ {
+		if !keep[i] {
+			continue
+		}
+		for j := i + 1; j < len(normalized); j++ {
+			if !keep[j] {
+				continue
+			}
+			if normalized[i].norm == normalized[j].norm {
+				keep[j] = false
+			} else if strings.Contains(normalized[i].norm, normalized[j].norm) {
+				keep[j] = false
+			} else if strings.Contains(normalized[j].norm, normalized[i].norm) {
+				keep[i] = false
+				break
+			}
+		}
+	}
+
+	var b strings.Builder
+	for i, n := range normalized {
+		if !keep[i] {
+			continue
+		}
+		if n.original.Quote != "" {
+			fmt.Fprintf(&b, "Quote: %s\n", n.original.Quote)
+		}
+		fmt.Fprintf(&b, "Observation: %s\n\n", n.original.Text)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // maxAssistantChars caps truncated assistant messages. Long assistant output is
@@ -1357,18 +1589,31 @@ type clusterSample struct {
 	Observations []string
 }
 
-// runSampleWithObs selects representative observations from each cluster.
+// runSampleWithObs selects representative observations from each cluster,
+// prioritizing observations with quotes (concrete exemplars).
 func runSampleWithObs(ctx context.Context, clusters []clusterResult, allObs []observationEntry, store storage.Store) []clusterSample {
 	var samples []clusterSample
 	for _, cl := range clusters {
 		indices := cl.ObservationIdxs
 
-		// Shuffle for random selection
-		shuffled := make([]int, len(indices))
-		copy(shuffled, indices)
-		rand.Shuffle(len(shuffled), func(i, j int) {
-			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		// Partition: quotes first, then non-quotes. Quotes carry voice and
+		// specificity that the summarize step can preserve; quoteless
+		// observations tend to produce more abstract summaries.
+		var withQuote, withoutQuote []int
+		for _, idx := range indices {
+			if allObs[idx].Quote != "" {
+				withQuote = append(withQuote, idx)
+			} else {
+				withoutQuote = append(withoutQuote, idx)
+			}
+		}
+		rand.Shuffle(len(withQuote), func(i, j int) {
+			withQuote[i], withQuote[j] = withQuote[j], withQuote[i]
 		})
+		rand.Shuffle(len(withoutQuote), func(i, j int) {
+			withoutQuote[i], withoutQuote[j] = withoutQuote[j], withoutQuote[i]
+		})
+		shuffled := append(withQuote, withoutQuote...)
 
 		var selected []string
 		tokens := 0

@@ -108,6 +108,22 @@ type Conversation struct {
 	Messages       []Message `json:"messages"`
 }
 
+// UnmarshalJSON accepts both conversation_id and the legacy session_id field.
+func (c *Conversation) UnmarshalJSON(data []byte) error {
+	type Alias Conversation
+	aux := &struct {
+		*Alias
+		SessionID string `json:"session_id"`
+	}{Alias: (*Alias)(c)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if c.ConversationID == "" && aux.SessionID != "" {
+		c.ConversationID = aux.SessionID
+	}
+	return nil
+}
+
 // Validate checks that required fields are present. This catches silent
 // deserialization failures (e.g. renamed JSON tags, corrupt data) that would
 // otherwise propagate empty strings through the system.

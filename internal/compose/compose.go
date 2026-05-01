@@ -62,6 +62,9 @@ type BaseOptions struct {
 	Sources []string
 	// Verbose enables per-item progress logging.
 	Verbose bool
+	// Extract selects the extraction strategy: "" (default full-conversation),
+	// "woo" (windowed owner-only), "adaptive" (woo-first with fallback).
+	Extract string
 }
 
 // Options configures a map-reduce compose run.
