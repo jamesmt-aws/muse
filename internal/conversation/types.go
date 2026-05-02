@@ -49,7 +49,8 @@ func Sources() []SourceInfo {
 		{Name: "codex", Provider: &Codex{}},
 		{Name: "kiro", Provider: &Kiro{}},
 		{Name: "kiro-cli", Provider: &KiroCLI{}},
-		{Name: "github", Provider: &GitHub{}, OptIn: true},
+		{Name: "github-issues", Provider: &GitHub{kind: "issue", source: "github-issues", displayName: "GitHub Issues"}, OptIn: true},
+		{Name: "github-prs", Provider: &GitHub{kind: "pr", source: "github-prs", displayName: "GitHub PRs"}, OptIn: true},
 		{Name: "slack", Provider: &Slack{}, OptIn: true},
 	}
 }
@@ -66,6 +67,17 @@ func Providers() []Provider {
 	return providers
 }
 
+// DefaultSourceNames returns the names of all non-opt-in sources.
+func DefaultSourceNames() []string {
+	var names []string
+	for _, s := range Sources() {
+		if !s.OptIn {
+			names = append(names, s.Name)
+		}
+	}
+	return names
+}
+
 // ProvidersFor returns providers matching the given source names. Includes
 // opt-in providers when explicitly named. Returns all default providers
 // when sources is empty.
@@ -76,14 +88,6 @@ func ProvidersFor(sources []string) []Provider {
 	wanted := make(map[string]bool, len(sources))
 	for _, s := range sources {
 		wanted[s] = true
-	}
-	// --all: include everything
-	if wanted["all"] {
-		var providers []Provider
-		for _, s := range Sources() {
-			providers = append(providers, s.Provider)
-		}
-		return providers
 	}
 	var providers []Provider
 	for _, s := range Sources() {
@@ -108,8 +112,11 @@ type Conversation struct {
 	Messages       []Message `json:"messages"`
 }
 
-// UnmarshalJSON accepts both conversation_id and the legacy session_id field.
+// UnmarshalJSON implements backward-compatible deserialization for Conversation.
+// Upstream tools rename fields without notice (e.g. session_id → conversation_id).
+// Per designs/sources.md "Format compatibility", the parser accepts both names.
 func (c *Conversation) UnmarshalJSON(data []byte) error {
+	// Alias avoids infinite recursion on UnmarshalJSON.
 	type Alias Conversation
 	aux := &struct {
 		*Alias
@@ -149,4 +156,26 @@ type ToolCall struct {
 	Name   string          `json:"name"`
 	Input  json.RawMessage `json:"input,omitempty"`
 	Output json.RawMessage `json:"output,omitempty"`
+}
+
+// SourceMetadata describes properties of a conversation source that the compose
+// pipeline needs but that aren't encoded in the conversation data itself.
+// Import plugins write this as .muse-source.json; muse persists it alongside
+// conversations so compose can read it from storage.
+type SourceMetadata struct {
+	Type string `json:"type"` // "human" or "ai"
+}
+
+// SourceMetadataKey returns the storage key for a source's metadata file.
+func SourceMetadataKey(source string) string {
+	return fmt.Sprintf("conversations/%s/.muse-source.json", source)
+}
+
+// BuiltinSourceNames returns the set of source names registered in Sources().
+func BuiltinSourceNames() map[string]bool {
+	names := make(map[string]bool)
+	for _, s := range Sources() {
+		names[s.Name] = true
+	}
+	return names
 }

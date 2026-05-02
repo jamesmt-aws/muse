@@ -14,8 +14,10 @@ go install github.com/ellistarn/muse@latest
 ```bash
 muse compose              # discover conversations and compose muse.md
 muse ask "your question"  # ask your muse directly
+muse eval                 # evaluate the muse against a base model
 muse listen               # start MCP server
 muse show                 # print muse.md
+muse show -o muse.pdf     # export as PDF
 ```
 
 Work directly with your muse as agent:
@@ -40,17 +42,33 @@ Or run as an MCP server so other agents can work with your muse:
 
 ## Sources
 
-Conversations are automatically discovered from:
+Local sources are activated automatically on first run: **Claude Code**, **OpenCode**, **Codex**, **Kiro**.
 
-- **Claude Code** — `~/.claude/projects/`
-- **Kiro** —
-  `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/`
-- **OpenCode** — `~/.local/share/opencode/opencode.db`
-- **Codex** — `~/.codex/`
-- **Slack** (opt-in) — Set `MUSE_SLACK_TOKEN` to a cookie file path for SAML SSO
-  or a raw token (`xoxp-`/`xoxc-`). Set `MUSE_SLACK_WORKSPACE` to your workspace
-  (comma-separated for multiple, e.g. `company.enterprise.slack.com`).
-  Run `muse compose slack`.
+Network sources require explicit opt-in:
+
+```bash
+muse add github-issues              # GitHub issues (requires gh auth)
+muse add github-prs                 # GitHub PRs (requires gh auth)
+muse add slack                      # Slack (set MUSE_SLACK_TOKEN and MUSE_SLACK_WORKSPACE)
+muse remove github-prs              # stop including a source
+muse sources                        # see what's active
+```
+
+Sources are remembered across runs — `muse compose` processes whatever is active.
+
+## Import Plugins
+
+Import external data from proprietary systems using plugins — executables named `muse-{name}` on `$PATH`:
+
+```bash
+muse import code-reviews            # run muse-code-reviews plugin
+muse import internal-chat           # run muse-internal-chat plugin
+muse import                         # re-import all previously imported sources (any source imported at least once)
+```
+
+Plugins receive `MUSE_OUTPUT_DIR` and write Conversation JSON files plus a `.muse-source.json`
+metadata file. See `examples/muse-test-plugin/` for a reference implementation and
+`designs/010-import.md` for the full design.
 
 ## Storage
 

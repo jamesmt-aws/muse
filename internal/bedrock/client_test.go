@@ -3,7 +3,6 @@ package bedrock
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,8 +61,27 @@ func TestConverseMessagesPreservesPartialResponseOnTruncation(t *testing.T) {
 	if got, want := resp.Usage.OutputTokens, 456; got != want {
 		t.Fatalf("OutputTokens = %d, want %d", got, want)
 	}
-	if !strings.Contains(err.Error(), "response truncated") {
-		t.Fatalf("err = %v, want truncation error", err)
+	if !inference.IsTruncated(err) {
+		t.Fatalf("err = %v, want TruncatedError", err)
+	}
+}
+
+func TestEffortForBudget(t *testing.T) {
+	tests := []struct {
+		budget int32
+		want   string
+	}{
+		{16000, "high"},
+		{12000, "high"},
+		{8000, "medium"},
+		{4000, "medium"},
+		{2000, "low"},
+		{0, "low"},
+	}
+	for _, tt := range tests {
+		if got := effortForBudget(tt.budget); got != tt.want {
+			t.Errorf("effortForBudget(%d) = %q, want %q", tt.budget, got, tt.want)
+		}
 	}
 }
 

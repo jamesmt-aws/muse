@@ -325,7 +325,7 @@ func TestLocalStore_GetConversation_AcceptsSessionIDAlias(t *testing.T) {
 	ctx := context.Background()
 
 	// Write a file with the old "session_id" JSON key (pre-rename schema).
-	// GetConversation must accept this via the UnmarshalJSON alias.
+	// Per designs/sources.md "Format compatibility", the parser accepts both names.
 	staleJSON := `{
 		"schema_version": 1,
 		"source": "opencode",
@@ -342,9 +342,9 @@ func TestLocalStore_GetConversation_AcceptsSessionIDAlias(t *testing.T) {
 
 	conv, err := store.GetConversation(ctx, "opencode", "old-conv-001")
 	if err != nil {
-		t.Fatalf("expected session_id alias to work, got error: %v", err)
+		t.Fatalf("expected session_id to be accepted as alias, got error: %v", err)
 	}
 	if conv.ConversationID != "old-conv-001" {
-		t.Fatalf("expected conversation_id=old-conv-001, got %q", conv.ConversationID)
+		t.Errorf("ConversationID = %q, want %q", conv.ConversationID, "old-conv-001")
 	}
 }

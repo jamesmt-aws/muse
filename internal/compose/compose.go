@@ -57,9 +57,6 @@ type BaseOptions struct {
 	Reobserve bool
 	// Limit caps how many conversations to process (0 means no limit).
 	Limit int
-	// Sources filters to conversations from specific sources (e.g. "kiro").
-	// Empty means all sources.
-	Sources []string
 	// Verbose enables per-item progress logging.
 	Verbose bool
 	// Extract selects the extraction strategy: "" (default full-conversation),
@@ -78,6 +75,9 @@ type Options struct {
 // from all observations. Observations are the source of truth for what has been
 // processed; there is no separate state file.
 func Run(ctx context.Context, store storage.Store, observeLLM, learnLLM inference.Client, opts Options) (*Result, error) {
+	// Preload source metadata for import sources so isHumanSource can resolve them
+	humanOverrides := loadHumanSources(ctx, store)
+
 	// List all conversations and existing observations
 	entries, err := store.ListConversations(ctx)
 	if err != nil {
@@ -93,23 +93,12 @@ func Run(ctx context.Context, store storage.Store, observeLLM, learnLLM inferenc
 		existingSet[sc.Source+"/"+sc.ConversationID] = true
 	}
 
-	// If reprocessing, clear existing observations (scoped to sources if set)
+	// If reprocessing, clear all existing observations
 	if opts.Reobserve {
-		if len(opts.Sources) > 0 {
-			for _, src := range opts.Sources {
-				if err := DeleteObservationsForSource(ctx, store, src); err != nil {
-					return nil, fmt.Errorf("failed to clear observations: %w", err)
-				}
-				if opts.Verbose {
-					fmt.Fprintf(os.Stderr, "Cleared observations/%s/\n", src)
-				}
-			}
-		} else {
-			if err := DeleteObservations(ctx, store); err != nil {
-				return nil, fmt.Errorf("failed to clear observations: %w", err)
-			}
-			fmt.Fprintln(os.Stderr, "Cleared observations/")
+		if err := DeleteObservations(ctx, store); err != nil {
+			return nil, fmt.Errorf("failed to clear observations: %w", err)
 		}
+		fmt.Fprintln(os.Stderr, "Cleared observations/")
 		// Rebuild observations set after deletion
 		existingObs, err = ListObservations(ctx, store)
 		if err != nil {
@@ -120,9 +109,6 @@ func Run(ctx context.Context, store storage.Store, observeLLM, learnLLM inferenc
 			existingSet[sc.Source+"/"+sc.ConversationID] = true
 		}
 	}
-
-	// Filter by sources if specified
-	entries = storage.FilterEntriesBySource(entries, opts.Sources)
 
 	// Diff: conversations without corresponding observations are pending
 	var pending []storage.ConversationEntry
@@ -176,7 +162,7 @@ func Run(ctx context.Context, store storage.Store, observeLLM, learnLLM inferenc
 					return
 				}
 				start := time.Now()
-				obs, usage, err := observeConversation(ctx, observeLLM, conv)
+				obs, usage, err := observeConversation(ctx, observeLLM, conv, humanOverrides)
 				n := completed.Add(1)
 				if err != nil {
 					mu.Lock()
@@ -189,7 +175,7 @@ func Run(ctx context.Context, store storage.Store, observeLLM, learnLLM inferenc
 
 				// Persist as structured JSON so both pipelines share a single format
 				items := parseObservationItems(obs)
-				fp := Fingerprint(entry.LastModified.Format(time.RFC3339Nano), Fingerprint(prompts.Extract, prompts.Refine))
+				fp := Fingerprint(entry.LastModified.Format(time.RFC3339Nano), Fingerprint(prompts.Observe, prompts.Refine))
 				structured := &Observations{
 					Fingerprint: fp,
 					Date:        entry.LastModified.Format("2006-01-02"),
@@ -306,8 +292,8 @@ type turn struct {
 	humanContent     string // human's message
 }
 
-func observeConversation(ctx context.Context, client inference.Client, conv *conversation.Conversation) (string, inference.Usage, error) {
-	refined, usage, err := extractAndRefine(ctx, client, conv, false)
+func observeConversation(ctx context.Context, client inference.Client, conv *conversation.Conversation, humanOverrides map[string]bool) (string, inference.Usage, error) {
+	refined, usage, err := observeAndRefine(ctx, client, conv, false, humanOverrides)
 	if err != nil {
 		return "", usage, err
 	}
@@ -317,7 +303,7 @@ func observeConversation(ctx context.Context, client inference.Client, conv *con
 // isEmpty checks if the LLM output has no substantive content.
 // isEmpty returns true if the LLM response is empty or a common null marker.
 // This prevents trivial responses like "None" or "N/A" from triggering
-// downstream LLM calls (e.g. a refine pass on empty extract output).
+// downstream LLM calls (e.g. a refine pass on empty observe output).
 func isEmpty(s string) bool {
 	s = strings.TrimSpace(s)
 	if len(s) == 0 {
@@ -335,7 +321,7 @@ func learn(ctx context.Context, client inference.Client, store storage.Store, ob
 		return "", "", inference.Usage{}, nil
 	}
 	input := strings.Join(observations, "\n\n---\n\n")
-	muse, usage, err := inference.Converse(ctx, client, prompts.Compose, input, inference.WithThinking(16000))
+	muse, usage, err := inference.Converse(ctx, client, prompts.Compose, input, inference.WithThinking(inference.DefaultThinkingBudget))
 	if err != nil {
 		return "", "", usage, err
 	}
@@ -398,8 +384,8 @@ const maxChunkChars = 200_000
 // the assistant message that preceded a human response with that human message.
 // For AI conversations, requires at least 2 human turns (corrections/preferences).
 // For peer conversations (e.g. Slack), a single human turn suffices since even
-// one substantive statement reveals reasoning and voice.
-func extractTurns(conv *conversation.Conversation) []turn {
+// one substantive statement reveals reasoning, awareness, and voice.
+func extractTurns(conv *conversation.Conversation, humanOverrides map[string]bool) []turn {
 	var userTurns int
 	for _, msg := range conv.Messages {
 		if msg.Role == "user" && len(msg.Content) > 0 {
@@ -407,7 +393,7 @@ func extractTurns(conv *conversation.Conversation) []turn {
 		}
 	}
 	minTurns := 2
-	if conv.Source == "slack" {
+	if isHumanSource(conv.Source, humanOverrides) {
 		minTurns = 1
 	}
 	if userTurns < minTurns {

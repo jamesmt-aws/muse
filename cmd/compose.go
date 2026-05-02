@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -27,7 +27,7 @@ func newComposeCmd() *cobra.Command {
 	var method string
 	var extract string
 	cmd := &cobra.Command{
-		Use:   "compose [source...]",
+		Use:   "compose",
 		Short: "Compose a muse from conversations",
 		Long: `Discovers new conversations, observes them, and composes a muse.md
 that captures how you think. Safe to run repeatedly — only new
@@ -36,35 +36,36 @@ muse is always recomposed.
 
 Two composition methods are available:
 
-  clustering (default) — labels observations, normalizes synonyms, groups by
-  label match, summarizes per-cluster, then composes muse.md. Produces
-  thematically coherent output.
+  clustering (default) — labels observations, themes them into canonical
+  patterns, groups by theme, summarizes per-cluster, then composes muse.md.
+  Produces thematically coherent output.
 
   map-reduce — observe maps each conversation into observations, then learn
   reduces all observations into a single muse.md. Simpler, sufficient for
   smaller observation sets.
 
-Optionally pass one or more source names to limit discovery and observation to
-those sources. Run "muse sources" to see what's available. Network sources like
-github and slack are opt-in — they only run when explicitly named. Pass "all" to
-include every source.
+Sources are remembered automatically. On first run, default (local) sources are
+activated. Use "muse add" and "muse remove" to manage sources. Run "muse sources"
+to see what's active.
 
 Use --learn to recompose the muse from existing observations without
 reprocessing conversations. Use --reobserve to reprocess conversations from scratch.`,
 		Example: `  muse compose                          # default: clustering
   muse compose --method=map-reduce      # simpler pipeline
-  muse compose codex                    # only Codex conversations
-  muse compose github                   # GitHub PRs and issues (opt-in, requires gh auth)
-  muse compose slack                    # Slack (opt-in, set MUSE_SLACK_TOKEN)
-  muse compose all                      # all sources including opt-in
-  muse compose kiro --reobserve         # re-observe kiro from scratch
+  muse compose --reobserve              # re-observe all from scratch
   muse compose --learn                  # recompose from existing observations
   muse compose --limit 50              # process at most 50 conversations`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			sources := args
 
 			store, err := newStore(ctx)
+			if err != nil {
+				return err
+			}
+
+			// Resolve active sources from observation directories.
+			// On first run, defaults are bootstrapped.
+			sources, err := compose.ResolveSources(ctx, store)
 			if err != nil {
 				return err
 			}
@@ -80,15 +81,16 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 				for _, w := range result.Warnings {
 					fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 				}
+				printSyncSummary(result)
 				uploaded = result.Uploaded
 				uploadBytes = result.Bytes
 			}
 
 			switch method {
 			case "clustering":
-				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, sources, reobserve, relabel, extract, limit, uploaded, uploadBytes)
+				return runClusteredCompose(ctx, cmd.OutOrStdout(), store, reobserve, relabel, extract, limit, uploaded, uploadBytes)
 			case "map-reduce":
-				return runMapReduceCompose(ctx, cmd.OutOrStdout(), store, sources, reobserve, learn, limit)
+				return runMapReduceCompose(ctx, cmd.OutOrStdout(), store, reobserve, learn, limit)
 			default:
 				return fmt.Errorf("unknown method %q (use 'clustering' or 'map-reduce')", method)
 			}
@@ -103,12 +105,12 @@ reprocessing conversations. Use --reobserve to reprocess conversations from scra
 	return cmd
 }
 
-func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, sources []string, reobserve, relabel bool, extract string, limit, uploaded, uploadBytes int) error {
-	observeLLM, err := newLLMClient(ctx, TierObserve)
+func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, relabel bool, extract string, limit, uploaded, uploadBytes int) error {
+	observeLLM, err := newLLMClient(ctx, TierFast)
 	if err != nil {
 		return err
 	}
-	composeLLM, err := newLLMClient(ctx, TierCompose)
+	composeLLM, err := newLLMClient(ctx, TierStrong)
 	if err != nil {
 		return err
 	}
@@ -116,13 +118,12 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 	result, err := compose.RunClustered(ctx, store,
 		observeLLM, // observe
 		observeLLM, // label
-		observeLLM, // summarize
+		composeLLM, // summarize
 		composeLLM, // compose
 		compose.ClusteredOptions{
 			BaseOptions: compose.BaseOptions{
 				Reobserve: reobserve,
 				Limit:     limit,
-				Sources:   sources,
 				Verbose:   verbose,
 				Extract:   extract,
 			},
@@ -138,22 +139,21 @@ func runClusteredCompose(ctx context.Context, stdout io.Writer, store storage.St
 	return printResult(stdout, result, false)
 }
 
-func runMapReduceCompose(ctx context.Context, stdout io.Writer, store storage.Store, sources []string, reobserve, learn bool, limit int) error {
+func runMapReduceCompose(ctx context.Context, stdout io.Writer, store storage.Store, reobserve, learn bool, limit int) error {
 	opts := compose.Options{
 		BaseOptions: compose.BaseOptions{
 			Reobserve: reobserve,
 			Limit:     limit,
-			Sources:   sources,
 			Verbose:   verbose,
 		},
 		Learn: learn,
 	}
 
-	observeLLM, err := newLLMClient(ctx, TierObserve)
+	observeLLM, err := newLLMClient(ctx, TierFast)
 	if err != nil {
 		return err
 	}
-	composeLLM, err := newLLMClient(ctx, TierCompose)
+	composeLLM, err := newLLMClient(ctx, TierStrong)
 	if err != nil {
 		return err
 	}
@@ -253,65 +253,135 @@ func runCompose(ctx context.Context, stdout, stderr io.Writer, store storage.Sto
 }
 
 // syncProgressRenderer returns a SyncProgressFunc that renders source sync
-// progress using the stage log system. Each source gets a "sync" stage line
-// that updates as discovery and fetching progress. The renderer is safe for
+// progress as a multi-line block on stderr. Each active source gets its own
+// line, updated in place using ANSI cursor movement. The renderer is safe for
 // concurrent use by multiple providers.
+//
+// The "done" phase removes the source's line from the block. Summary lines are
+// printed after Upload returns via printSyncSummary.
 func syncProgressRenderer() muse.SyncProgressFunc {
 	var mu sync.Mutex
 	tty := output.IsTTY()
-	// Track per-source state to show meaningful summary on completion.
-	type sourceState struct {
-		start  time.Time
-		detail string
-		done   bool
+	active := map[string]conversation.SyncProgress{}
+	var order []string
+	done := map[string]bool{}
+	lines := 0 // number of progress lines currently rendered
+
+	// renderBlock moves the cursor to the top of the progress block and
+	// re-renders one line per active source. Each line ends with a
+	// clear-to-end-of-line escape to prevent ghosting from longer previous
+	// content. The cursor is left at the bottom of the block so the next
+	// call can move up `lines` rows to reach the top. Must be called with
+	// mu held.
+	renderBlock := func() {
+		if !tty {
+			return
+		}
+		// Move cursor to the top of the block.
+		if lines > 0 {
+			fmt.Fprintf(os.Stderr, "\033[%dA", lines)
+		}
+		n := 0
+		for _, src := range order {
+			p, ok := active[src]
+			if !ok {
+				continue
+			}
+			name := strings.ToLower(src)
+			switch p.Phase {
+			case "discovering":
+				detail := ""
+				if p.Detail != "" {
+					detail = ": " + p.Detail
+				}
+				fmt.Fprintf(os.Stderr, "\r%-*ssync %s: discovering%s\033[K\n", output.StageWidth, "", name, detail)
+			case "fetching":
+				if p.Total > 0 && p.Current > 0 {
+					bar := output.RenderBar(p.Current, p.Total, output.BarWidth)
+					if p.Detail != "" {
+						fmt.Fprintf(os.Stderr, "\r%-*s%s %s %d/%d (%s)\033[K\n", output.StageWidth, "", bar, name, p.Current, p.Total, p.Detail)
+					} else {
+						fmt.Fprintf(os.Stderr, "\r%-*s%s %s %d/%d\033[K\n", output.StageWidth, "", bar, name, p.Current, p.Total)
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "\r%-*ssync %s: fetching...\033[K\n", output.StageWidth, "", name)
+				}
+			}
+			n++
+		}
+		// If the block shrank, clear leftover lines from the previous render.
+		for i := n; i < lines; i++ {
+			fmt.Fprintf(os.Stderr, "\r\033[K\n")
+		}
+		// Cursor is now at the bottom of max(n, lines) emitted newlines.
+		// If the block shrank, move up to sit at the bottom of the active
+		// content (row n), not the bottom of the old block.
+		if overshoot := max(n, lines) - n; overshoot > 0 {
+			fmt.Fprintf(os.Stderr, "\033[%dA", overshoot)
+		}
+		lines = n
 	}
-	sources := map[string]*sourceState{}
+
+	// clearBlock erases the progress block so that a persistent log line can
+	// be printed above it. Must be called with mu held.
+	clearBlock := func() {
+		if !tty || lines == 0 {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "\033[%dA", lines)
+		for range lines {
+			fmt.Fprintf(os.Stderr, "\r\033[K\n")
+		}
+		fmt.Fprintf(os.Stderr, "\033[%dA", lines)
+		lines = 0
+	}
 
 	return func(source string, p conversation.SyncProgress) {
 		mu.Lock()
 		defer mu.Unlock()
 
-		name := strings.ToLower(source)
-		st, exists := sources[name]
-		if !exists {
-			st = &sourceState{start: time.Now()}
-			sources[name] = st
-		}
-		if p.Detail != "" {
-			st.detail = p.Detail
-		}
-
 		switch p.Phase {
-		case "discovering":
-			if tty {
-				fmt.Fprintf(os.Stderr, "\r%-*ssync %s: discovering...", output.StageWidth, "", name)
+		case "discovering", "fetching":
+			if _, exists := active[source]; !exists {
+				order = append(order, source)
 			}
-		case "fetching":
-			if p.Total > 0 && p.Current > 0 && tty {
-				bar := output.RenderBar(p.Current, p.Total, output.BarWidth)
-				fmt.Fprintf(os.Stderr, "\r%-*s%s %s %d/%d", output.StageWidth, "", bar, name, p.Current, p.Total)
-			}
+			active[source] = p
+			renderBlock()
 		case "log":
-			// Persistent one-line event (e.g. auth success). Clear any
-			// transient status, print on its own line.
-			if tty {
-				output.ClearLine()
-			}
+			clearBlock()
+			name := strings.ToLower(source)
 			output.LogStage("sync", "%s: %s", name, p.Detail).Print()
+			renderBlock()
 		case "done":
-			if !st.done {
-				st.done = true
-				if tty {
-					output.ClearLine()
-				}
-				detail := st.detail
-				if p.Detail != "" {
-					detail = p.Detail
-				}
-				if detail != "" {
-					output.LogStage("sync", "%s: %s", name, detail).Duration(time.Since(st.start)).Print()
+			if !done[source] {
+				done[source] = true
+				delete(active, source)
+				if len(active) == 0 {
+					clearBlock()
+				} else {
+					renderBlock()
 				}
 			}
 		}
+	}
+}
+
+// printSyncSummary prints per-source sync lines with cache information.
+// Each source shows total conversations and how many were new (uploaded).
+func printSyncSummary(result *muse.UploadResult) {
+	sources := make([]string, 0, len(result.SourceTotals))
+	for s := range result.SourceTotals {
+		sources = append(sources, s)
+	}
+	sort.Strings(sources)
+
+	for _, source := range sources {
+		total := result.SourceTotals[source]
+		newCount := result.SourceCounts[source] // 0 if not in map
+		displayName := strings.ReplaceAll(source, "-", " ")
+
+		detail := fmt.Sprintf("%d conversations (%d new)", total, newCount)
+
+		output.LogStage("sync", "%s: %s", displayName, detail).Print()
 	}
 }

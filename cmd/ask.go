@@ -12,14 +12,16 @@ import (
 )
 
 func newAskCmd() *cobra.Command {
-	return &cobra.Command{
+	var newSession bool
+	cmd := &cobra.Command{
 		Use:   "ask [question]",
 		Short: "Ask your muse a question",
-		Long: `Sends a question to your muse and streams the response. Each call is
-stateless — your muse has no recall of previous questions. Ask opinionated
-questions ("Is X a good approach for Y?") rather than factual lookups.`,
+		Long: `Sends a question to your muse and streams the response. By default, continues
+the most recent conversation so your muse remembers prior context. Use --new
+to start a fresh session.`,
 		Example: `  muse ask "Is a monorepo the right call for this project?"
-  muse ask "How should I structure error handling in Go?"`,
+  muse ask "Tell me more about that"
+  muse ask --new "How should I structure error handling in Go?"`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -28,24 +30,50 @@ questions ("Is X a good approach for Y?") rather than factual lookups.`,
 				return err
 			}
 			document := loadDocument(ctx, store)
-			llm, err := newLLMClient(ctx, TierCompose)
+			llm, err := newLLMClient(ctx, TierStrong)
 			if err != nil {
 				return err
 			}
-			m := muse.New(llm, document)
+
+			dir, err := sessionsDir()
+			if err != nil {
+				return err
+			}
+			m := muse.New(llm, document, muse.WithSessionsDir(dir))
+
 			question := strings.Join(args, " ")
-			var wroteOutput bool
-			_, err = m.Ask(ctx, muse.AskInput{
+			var inThinking bool
+			result, err := m.Ask(ctx, muse.AskInput{
 				Question: question,
+				New:      newSession,
 				StreamFunc: inference.StreamFunc(func(delta inference.StreamDelta) {
-					fmt.Fprint(os.Stdout, delta.Text)
-					wroteOutput = true
+					if delta.Thinking && !verbose {
+						return
+					}
+					if delta.Thinking {
+						if !inThinking {
+							inThinking = true
+							fmt.Fprint(os.Stderr, "\033[2m") // dim
+						}
+						fmt.Fprint(os.Stderr, delta.Text)
+					} else {
+						if inThinking {
+							inThinking = false
+							fmt.Fprint(os.Stderr, "\033[0m\n") // reset + newline before response
+						}
+						fmt.Fprint(os.Stdout, delta.Text)
+					}
 				}),
 			})
-			if wroteOutput {
+			if result != nil && result.Response != "" {
 				fmt.Fprintln(os.Stdout) // trailing newline after stream completes
+			}
+			if result != nil {
+				m.SetLatest(result.SessionID)
 			}
 			return err
 		},
 	}
+	cmd.Flags().BoolVar(&newSession, "new", false, "start a fresh session instead of continuing the last one")
+	return cmd
 }

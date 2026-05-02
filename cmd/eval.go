@@ -1,0 +1,723 @@
+package cmd
+
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/ellistarn/muse/internal/compose"
+	"github.com/ellistarn/muse/internal/inference"
+	"github.com/ellistarn/muse/internal/muse"
+	"github.com/ellistarn/muse/internal/output"
+	"github.com/ellistarn/muse/internal/storage"
+	"github.com/ellistarn/muse/prompts"
+)
+
+//go:embed evals/questions.json
+var defaultQuestions []byte
+
+// evalQuestion is a single evaluation question with metadata.
+type evalQuestion struct {
+	ID       string   `json:"id"`
+	Category string   `json:"category"`
+	Tags     []string `json:"tags,omitempty"`
+	Prompt   string   `json:"prompt"`
+}
+
+// evalScores holds dimension scores from a judge call.
+type evalScores struct {
+	Values map[string]int
+}
+
+// evalResult holds the complete evaluation for one question.
+type evalResult struct {
+	Question     evalQuestion
+	BaseResponse string
+	MuseResponse string
+	BaseIsA      bool // true if base was randomly assigned to "Response A"
+	BaseScores   evalScores
+	MuseScores   evalScores
+	Preferred    string // "base", "muse", "neither"
+	Rationale    string
+	Error        error
+}
+
+// cachedResponse is the on-disk format for a cached eval response.
+type cachedResponse struct {
+	Fingerprint string `json:"fingerprint"`
+	Response    string `json:"response"`
+}
+
+func newEvalCmd() *cobra.Command {
+	var evalDir string
+
+	cmd := &cobra.Command{
+		Use:   "eval",
+		Short: "Evaluate how the muse changes response quality",
+		Long: `Runs each question twice — once with the muse, once without — then blind
+judges score both responses on three dimensions plus an overall preference.
+
+Dimensions (scored 1-5, where 3 = strong base model):
+  Reasoning:   distinctive mental models and reasoning moves
+  Voice:       structural commitment, compression, reframing
+  Awareness:   actionable self-awareness, calibrated confidence
+
+A separate preference judge picks which response demonstrates better overall
+judgment, capturing signal the dimension scores may miss.
+
+Questions include universal judgment probes plus domain-specific questions
+generated from the muse.md to measure transferability.`,
+		Example: `  muse eval
+  muse eval -v
+  muse eval --dir ./my-questions`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			store, err := newStore(ctx)
+			if err != nil {
+				return err
+			}
+			document := loadDocument(ctx, store)
+			if document == "" {
+				return fmt.Errorf("no muse.md found — run 'muse compose' first")
+			}
+			llm, err := newLLMClient(ctx, TierStrong)
+			if err != nil {
+				return err
+			}
+
+			// Load universal questions
+			questions, err := loadUniversalQuestions()
+			if err != nil {
+				return fmt.Errorf("load questions: %w", err)
+			}
+
+			// Generate domain questions from the muse
+			domainQuestions, err := generateDomainQuestions(ctx, llm, document, store)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not generate domain questions: %v\n", err)
+			} else {
+				questions = append(questions, domainQuestions...)
+			}
+
+			// Load custom questions from --dir
+			if evalDir != "" {
+				custom, err := loadCustomQuestions(evalDir)
+				if err != nil {
+					return fmt.Errorf("load custom questions: %w", err)
+				}
+				questions = append(questions, custom...)
+			}
+
+			if len(questions) == 0 {
+				return fmt.Errorf("no questions found")
+			}
+
+			withMuse := muse.New(llm, document)
+			withoutMuse := muse.New(llm, "")
+			model := shortModel(llm.Model())
+			museHash := compose.Fingerprint(document)[:12]
+
+			fmt.Fprintf(os.Stderr, "eval  %d cases  %s\n\n", len(questions), model)
+
+			// Run all cases in parallel — the LLM client's rate limiter
+			// handles saturation, so no artificial concurrency bound.
+			results := make([]evalResult, len(questions))
+			var completed atomic.Int32
+			progress := output.StartProgress(len(questions), &completed)
+
+			g, ctx := errgroup.WithContext(ctx)
+			for i, q := range questions {
+				g.Go(func() error {
+					results[i] = runEvalCase(ctx, q, llm, withMuse, withoutMuse, store, museHash)
+					completed.Add(1)
+					return nil
+				})
+			}
+			g.Wait()
+			progress.Stop()
+
+			// Print results: summary table → profile → (verbose: detail)
+			stdout := cmd.OutOrStdout()
+			printSummaryTable(stdout, results)
+			fmt.Fprintln(stdout)
+			printEvalProfile(stdout, results)
+
+			if verbose {
+				fmt.Fprintln(stdout)
+				printEvalDetail(stdout, results)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&evalDir, "dir", "", "directory of additional .md question files")
+	return cmd
+}
+
+// runEvalCase generates responses, blinds them, and runs both judge calls.
+func runEvalCase(ctx context.Context, q evalQuestion, llm inference.Client, withMuse, withoutMuse *muse.Muse, store storage.Store, museHash string) evalResult {
+	result := evalResult{Question: q}
+
+	// Cache keys
+	baseFP := compose.Fingerprint(q.Prompt, llm.Model())
+	museFP := compose.Fingerprint(q.Prompt, llm.Model(), museHash)
+	baseKey := fmt.Sprintf("eval/baseline/%s.json", baseFP[:16])
+	museKey := fmt.Sprintf("eval/muse/%s.json", museFP[:16])
+
+	// Generate responses in parallel
+	var baseResp, museResp string
+	var baseErr, museErr error
+	var inner sync.WaitGroup
+	inner.Add(2)
+	go func() {
+		defer inner.Done()
+		if cached, err := loadCachedResponse(ctx, store, baseKey, baseFP); err == nil {
+			baseResp = cached
+			return
+		}
+		r, err := withoutMuse.Ask(ctx, muse.AskInput{Question: q.Prompt})
+		if err != nil {
+			baseErr = err
+			return
+		}
+		baseResp = r.Response
+		saveCachedResponse(ctx, store, baseKey, baseFP, baseResp)
+	}()
+	go func() {
+		defer inner.Done()
+		if cached, err := loadCachedResponse(ctx, store, museKey, museFP); err == nil {
+			museResp = cached
+			return
+		}
+		r, err := withMuse.Ask(ctx, muse.AskInput{Question: q.Prompt})
+		if err != nil {
+			museErr = err
+			return
+		}
+		museResp = r.Response
+		saveCachedResponse(ctx, store, museKey, museFP, museResp)
+	}()
+	inner.Wait()
+
+	if baseErr != nil {
+		result.Error = baseErr
+		return result
+	}
+	if museErr != nil {
+		result.Error = museErr
+		return result
+	}
+
+	result.BaseResponse = baseResp
+	result.MuseResponse = museResp
+
+	// Blind: randomly assign to A/B
+	result.BaseIsA = rand.IntN(2) == 0
+	var respA, respB string
+	if result.BaseIsA {
+		respA, respB = baseResp, museResp
+	} else {
+		respA, respB = museResp, baseResp
+	}
+
+	blindedInput := fmt.Sprintf("## Question\n%s\n\n## Response A\n%s\n\n## Response B\n%s",
+		strings.TrimSpace(q.Prompt), respA, respB)
+
+	// Run both judge calls in parallel (never cached — cheap, benefits from prompt iteration)
+	var dimResp, prefResp string
+	var dimErr, prefErr error
+	var judgeWg sync.WaitGroup
+	judgeWg.Add(2)
+	go func() {
+		defer judgeWg.Done()
+		dimResp, _, dimErr = inference.Converse(ctx, llm, prompts.JudgeDimensions, blindedInput)
+	}()
+	go func() {
+		defer judgeWg.Done()
+		prefResp, _, prefErr = inference.Converse(ctx, llm, prompts.JudgePreference, blindedInput)
+	}()
+	judgeWg.Wait()
+
+	if dimErr != nil {
+		result.Error = dimErr
+		return result
+	}
+	if prefErr != nil {
+		result.Error = prefErr
+		return result
+	}
+
+	// Parse scores
+	aScores, bScores := parseJudgeScores(dimResp)
+	preferred, rationale := parsePreference(prefResp)
+
+	// De-blind
+	if result.BaseIsA {
+		result.BaseScores = aScores
+		result.MuseScores = bScores
+	} else {
+		result.BaseScores = bScores
+		result.MuseScores = aScores
+	}
+
+	// De-blind preference
+	switch preferred {
+	case "A":
+		if result.BaseIsA {
+			result.Preferred = "base"
+		} else {
+			result.Preferred = "muse"
+		}
+	case "B":
+		if result.BaseIsA {
+			result.Preferred = "muse"
+		} else {
+			result.Preferred = "base"
+		}
+	default:
+		result.Preferred = "neither"
+	}
+	result.Rationale = rationale
+
+	return result
+}
+
+// --- Scoring ---
+
+var scorePattern = regexp.MustCompile(`(\w+)=(\d)`)
+
+func parseScoreMap(line string) evalScores {
+	s := evalScores{Values: map[string]int{}}
+	for _, match := range scorePattern.FindAllStringSubmatch(line, -1) {
+		if n, err := strconv.Atoi(match[2]); err == nil {
+			s.Values[match[1]] = n
+		}
+	}
+	return s
+}
+
+// parseJudgeScores extracts RESPONSE_A and RESPONSE_B score lines.
+func parseJudgeScores(raw string) (a, b evalScores) {
+	a = evalScores{Values: map[string]int{}}
+	b = evalScores{Values: map[string]int{}}
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "RESPONSE_A:") {
+			a = parseScoreMap(trimmed)
+		} else if strings.HasPrefix(trimmed, "RESPONSE_B:") {
+			b = parseScoreMap(trimmed)
+		}
+	}
+	return
+}
+
+// parsePreference extracts PREFERRED and RATIONALE from epistemic judge output.
+func parsePreference(raw string) (preferred, rationale string) {
+	preferred = "neither"
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "PREFERRED:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "PREFERRED:"))
+			val = strings.ToUpper(val)
+			if strings.HasPrefix(val, "A") {
+				preferred = "A"
+			} else if strings.HasPrefix(val, "B") {
+				preferred = "B"
+			} else {
+				preferred = "neither"
+			}
+		} else if strings.HasPrefix(trimmed, "RATIONALE:") {
+			rationale = strings.TrimSpace(strings.TrimPrefix(trimmed, "RATIONALE:"))
+		}
+	}
+	return
+}
+
+// --- Output ---
+
+var allDims = []string{"reasoning", "voice", "awareness"}
+
+var dimLabels = map[string]string{
+	"reasoning": "Reasoning",
+	"voice":     "Voice",
+	"awareness": "Awareness",
+}
+
+// printSummaryTable prints a per-case score grid, grouped by outcome:
+// muse-preferred first, then neither, then base-preferred, then errors.
+func printSummaryTable(w io.Writer, results []evalResult) {
+	type row struct {
+		icon   string
+		id     string
+		scores string // pre-formatted "N→N  N→N  N→N" or empty for errors
+		pref   string
+		rank   int // sort key: 0=muse, 1=neither, 2=base, 3=error
+	}
+
+	var rows []row
+	var maxID int
+	for _, r := range results {
+		if len(r.Question.ID) > maxID {
+			maxID = len(r.Question.ID)
+		}
+		if r.Error != nil {
+			rows = append(rows, row{"!", r.Question.ID, "", "error", 3})
+			continue
+		}
+		icon, rank := "~", 1
+		switch r.Preferred {
+		case "muse":
+			icon, rank = "✓", 0
+		case "base":
+			icon, rank = "✗", 2
+		}
+		var parts []string
+		for _, dim := range allDims {
+			parts = append(parts, fmt.Sprintf("%d→%d", r.BaseScores.Values[dim], r.MuseScores.Values[dim]))
+		}
+		rows = append(rows, row{icon, r.Question.ID, strings.Join(parts, "  "), r.Preferred, rank})
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].rank < rows[j].rank })
+
+	// Header — column positions match data rows (icon + space + id + gap + scores)
+	fmt.Fprintf(w, "%sRea  Voi  Awa\n", strings.Repeat(" ", maxID+6))
+	fmt.Fprintf(w, "  %s\n", strings.Repeat("─", maxID+20))
+	for _, r := range rows {
+		if r.scores == "" {
+			fmt.Fprintf(w, "  %s %-*s  %s\n", r.icon, maxID, r.id, r.pref)
+		} else {
+			fmt.Fprintf(w, "  %s %-*s  %s   %s\n", r.icon, maxID, r.id, r.scores, r.pref)
+		}
+	}
+}
+
+func printEvalProfile(w io.Writer, results []evalResult) {
+	var valid []evalResult
+	for _, r := range results {
+		if r.Error == nil {
+			valid = append(valid, r)
+		}
+	}
+	if len(valid) == 0 {
+		fmt.Fprintln(w, "No valid results.")
+		return
+	}
+
+	printDimensionTable(w, valid)
+	fmt.Fprintln(w)
+	printTransferability(w, valid)
+	fmt.Fprintln(w)
+
+	var museN, baseN, neitherN int
+	for _, r := range valid {
+		switch r.Preferred {
+		case "muse":
+			museN++
+		case "base":
+			baseN++
+		default:
+			neitherN++
+		}
+	}
+	fmt.Fprintf(w, "Preferred: Muse %d/%d · Base %d/%d · Neither %d/%d\n",
+		museN, len(valid), baseN, len(valid), neitherN, len(valid))
+}
+
+func printDimensionTable(w io.Writer, results []evalResult) {
+	fmt.Fprintf(w, "  %-22s  %4s  %4s  %5s\n", "", "Base", "Muse", "Delta")
+	fmt.Fprintf(w, "  %s\n", strings.Repeat("─", 42))
+
+	for _, dim := range allDims {
+		var baseSum, museSum, count int
+		for _, r := range results {
+			bs, bOk := r.BaseScores.Values[dim]
+			ms, mOk := r.MuseScores.Values[dim]
+			if bOk && mOk {
+				baseSum += bs
+				museSum += ms
+				count++
+			}
+		}
+		if count == 0 {
+			continue
+		}
+		baseAvg := float64(baseSum) / float64(count)
+		museAvg := float64(museSum) / float64(count)
+		delta := museAvg - baseAvg
+		sign := "+"
+		if delta < 0 {
+			sign = ""
+		}
+		label := dimLabels[dim]
+		if label == "" {
+			label = dim
+		}
+		fmt.Fprintf(w, "  %-22s  %4.1f  %4.1f  %s%.1f\n",
+			label, baseAvg, museAvg, sign, delta)
+	}
+}
+
+func printTransferability(w io.Writer, results []evalResult) {
+	type group struct {
+		count int
+		delta float64
+	}
+	displayOrder := []string{"domain", "universal"}
+	displayLabels := map[string]string{
+		"domain":    "Domain",
+		"universal": "Universal",
+	}
+	groups := map[string]*group{}
+	for _, name := range displayOrder {
+		groups[name] = &group{}
+	}
+
+	for _, r := range results {
+		gName := transferGroup(r.Question.Category)
+		g := groups[gName]
+
+		var deltaSum float64
+		var dimCount int
+		for _, dim := range allDims {
+			bs, bOk := r.BaseScores.Values[dim]
+			ms, mOk := r.MuseScores.Values[dim]
+			if bOk && mOk {
+				deltaSum += float64(ms - bs)
+				dimCount++
+			}
+		}
+		if dimCount > 0 {
+			g.count++
+			g.delta += deltaSum / float64(dimCount)
+		}
+	}
+
+	fmt.Fprintf(w, "  %-22s  %5s  %5s\n", "Transferability", "Cases", "Avg Δ")
+	fmt.Fprintf(w, "  %s\n", strings.Repeat("─", 38))
+	for _, name := range displayOrder {
+		g := groups[name]
+		if g.count == 0 {
+			continue
+		}
+		avg := g.delta / float64(g.count)
+		sign := "+"
+		if avg < 0 {
+			sign = ""
+		}
+		label := displayLabels[name]
+		if label == "" {
+			label = name
+		}
+		fmt.Fprintf(w, "  %-22s  %5d  %s%.1f\n", label, g.count, sign, avg)
+	}
+}
+
+func printEvalDetail(w io.Writer, results []evalResult) {
+	for _, r := range results {
+		if r.Error != nil {
+			continue
+		}
+		fmt.Fprintf(w, "── %s (%s) %s\n\n", r.Question.ID, r.Question.Category,
+			strings.Repeat("─", max(0, 72-len(r.Question.ID)-len(r.Question.Category))))
+
+		// Scores
+		fmt.Fprintf(w, "  ")
+		for _, dim := range allDims {
+			bs := r.BaseScores.Values[dim]
+			ms := r.MuseScores.Values[dim]
+			label := dimLabels[dim]
+			if label == "" {
+				label = dim
+			}
+			fmt.Fprintf(w, "%s: %d→%d  ", label, bs, ms)
+		}
+		fmt.Fprintln(w)
+
+		// Preference
+		fmt.Fprintf(w, "  Preferred: %s\n", r.Preferred)
+
+		// Rationale — wrapped paragraph
+		if r.Rationale != "" {
+			fmt.Fprintf(w, "\n%s\n", wordWrap(r.Rationale, 74, "  "))
+		}
+		fmt.Fprintln(w)
+	}
+}
+
+// --- Helpers ---
+
+// transferGroup maps a question category to a transferability group.
+func transferGroup(category string) string {
+	switch category {
+	case "in-domain", "adjacent-domain", "out-of-domain":
+		return "domain"
+	default:
+		return "universal"
+	}
+}
+
+// wordWrap breaks s into lines of at most width display columns,
+// splitting on word boundaries and prefixing each line with indent.
+func wordWrap(s string, width int, indent string) string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return ""
+	}
+	var lines []string
+	line := indent + words[0]
+	for _, w := range words[1:] {
+		if len(line)+1+len(w) > width {
+			lines = append(lines, line)
+			line = indent + w
+		} else {
+			line += " " + w
+		}
+	}
+	lines = append(lines, line)
+	return strings.Join(lines, "\n")
+}
+
+// shortModel strips common provider prefixes from model identifiers.
+func shortModel(model string) string {
+	if idx := strings.LastIndex(model, "."); idx != -1 {
+		parts := strings.Split(model, ".")
+		if len(parts) > 2 {
+			return parts[len(parts)-1]
+		}
+	}
+	return model
+}
+
+// --- Question loading ---
+
+func loadUniversalQuestions() ([]evalQuestion, error) {
+	var questions []evalQuestion
+	if err := json.Unmarshal(defaultQuestions, &questions); err != nil {
+		return nil, fmt.Errorf("parse built-in questions: %w", err)
+	}
+	return questions, nil
+}
+
+func generateDomainQuestions(ctx context.Context, llm inference.Client, document string, store storage.Store) ([]evalQuestion, error) {
+	// Check cache (keyed on muse content)
+	museHash := compose.Fingerprint(document)[:16]
+	cacheKey := fmt.Sprintf("eval/domain-questions/%s.json", museHash)
+	if data, err := store.GetData(ctx, cacheKey); err == nil {
+		var questions []evalQuestion
+		if err := json.Unmarshal(data, &questions); err == nil {
+			return questions, nil
+		}
+	}
+
+	resp, _, err := inference.Converse(ctx, llm, prompts.GenerateEval, document)
+	if err != nil {
+		return nil, err
+	}
+
+	jsonStr := extractJSON(resp)
+	var questions []evalQuestion
+	if err := json.Unmarshal([]byte(jsonStr), &questions); err != nil {
+		return nil, fmt.Errorf("parse generated questions (raw response length %d): %w", len(resp), err)
+	}
+	if len(questions) == 0 {
+		return nil, fmt.Errorf("generated question set is empty")
+	}
+
+	// Cache for next run
+	if data, err := json.Marshal(questions); err == nil {
+		store.PutData(ctx, cacheKey, data)
+	}
+	return questions, nil
+}
+
+// extractJSON finds a JSON array in text that may be wrapped in markdown code blocks.
+// Returns the extracted substring, which the caller must validate by unmarshaling.
+func extractJSON(s string) string {
+	// Try the whole string first (model followed instructions)
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		return trimmed
+	}
+	// Strip markdown code fences
+	if idx := strings.Index(s, "```"); idx != -1 {
+		// Find content between first and last fence
+		start := strings.Index(s[idx+3:], "\n")
+		if start != -1 {
+			inner := s[idx+3+start+1:]
+			if end := strings.Index(inner, "```"); end != -1 {
+				inner = strings.TrimSpace(inner[:end])
+				if strings.HasPrefix(inner, "[") && strings.HasSuffix(inner, "]") {
+					return inner
+				}
+			}
+		}
+	}
+	// Last resort: first [ to last ]
+	if idx := strings.Index(s, "["); idx != -1 {
+		if end := strings.LastIndex(s, "]"); end > idx {
+			return s[idx : end+1]
+		}
+	}
+	return s
+}
+
+func loadCustomQuestions(dir string) ([]evalQuestion, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var questions []evalQuestion
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		questions = append(questions, evalQuestion{
+			ID:       strings.TrimSuffix(e.Name(), ".md"),
+			Category: "custom",
+			Prompt:   string(data),
+		})
+	}
+	return questions, nil
+}
+
+// --- Caching ---
+
+func loadCachedResponse(ctx context.Context, store storage.Store, key, fingerprint string) (string, error) {
+	data, err := store.GetData(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	var cached cachedResponse
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return "", err
+	}
+	if cached.Fingerprint != fingerprint {
+		return "", fmt.Errorf("fingerprint mismatch")
+	}
+	return cached.Response, nil
+}
+
+func saveCachedResponse(ctx context.Context, store storage.Store, key, fingerprint, response string) {
+	data, err := json.Marshal(cachedResponse{Fingerprint: fingerprint, Response: response})
+	if err != nil {
+		return
+	}
+	store.PutData(ctx, key, data)
+}

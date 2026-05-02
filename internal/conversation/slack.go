@@ -68,6 +68,10 @@ func (s *Slack) Conversations(ctx context.Context, progress func(SyncProgress)) 
 	if err != nil {
 		return nil, fmt.Errorf("slack: %w", err)
 	}
+	if len(allCreds) == 0 {
+		progress(SyncProgress{Phase: "log", Detail: "MUSE_SLACK_TOKEN is not set, skipping Slack source"})
+		return nil, nil
+	}
 
 	cacheDir, err := slackCacheDir()
 	if err != nil {
@@ -102,18 +106,23 @@ func (s *Slack) Conversations(ctx context.Context, progress func(SyncProgress)) 
 }
 
 func syncWorkspace(ctx context.Context, creds slackCreds, cacheDir string, progress func(SyncProgress)) ([]Conversation, error) {
+	onThrottle := func(label string, rate float64) {
+		progress(SyncProgress{Phase: "log", Detail: fmt.Sprintf("%s rate → %.0f req/s", label, rate)})
+	}
 
 	searchLimiter := throttle.NewAIMDLimiter(ctx, throttle.Config{
-		SeedRate: 0.5,
-		MaxRate:  0.5,
-		Label:    "slack-search",
+		SeedRate:   0.5,
+		MaxRate:    0.5,
+		Label:      "slack-search",
+		OnThrottle: onThrottle,
 	})
 	defer searchLimiter.Close()
 
 	repliesLimiter := throttle.NewAIMDLimiter(ctx, throttle.Config{
-		SeedRate: 2,
-		MaxRate:  2,
-		Label:    "slack-replies",
+		SeedRate:   2,
+		MaxRate:    2,
+		Label:      "slack-replies",
+		OnThrottle: onThrottle,
 	})
 	defer repliesLimiter.Close()
 
@@ -881,7 +890,7 @@ type slackCreds struct {
 }
 
 // resolveSlackCredentials interprets MUSE_SLACK_TOKEN:
-//   - Empty: return error (source was explicitly requested)
+//   - Empty: return (nil, nil) — not configured, skip silently
 //   - File path (starts with / or ~/): discover workspaces from cookie domains,
 //     run SAML SSO for each. MUSE_SLACK_WORKSPACE overrides discovery with a
 //     single workspace.
@@ -889,7 +898,7 @@ type slackCreds struct {
 func resolveSlackCredentials(progress func(SyncProgress)) ([]slackCreds, error) {
 	val := os.Getenv("MUSE_SLACK_TOKEN")
 	if val == "" {
-		return nil, fmt.Errorf("MUSE_SLACK_TOKEN not set (set to a SAML cookie file path for SSO, or a raw xoxp-/xoxc- token)")
+		return nil, nil // not configured
 	}
 
 	if strings.HasPrefix(val, "~/") {

@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -23,6 +24,11 @@ import (
 // a cluster. Labels with fewer observations flow through as noise.
 const minClusterSize = 3
 
+// themeThreshold triggers vocabulary theming when the number of unique
+// labels exceeds this count. Cold-start parallel labeling produces fragmented
+// vocabularies; the theme step consolidates them into canonical themes.
+const themeThreshold = 50
+
 // ClusteredOptions configures a clustered compose run.
 type ClusteredOptions struct {
 	BaseOptions
@@ -34,10 +40,11 @@ type ClusteredOptions struct {
 }
 
 // RunClustered executes the full clustering composition pipeline:
-// observe → label → normalize → group → sample → summarize → compose → diff.
+// observe → label → theme → group → sample → summarize → compose → diff.
 //
-// Grouping is by exact label match — shared label vocabulary plus normalization
-// produces a shared vocabulary, making embedding-based clustering unnecessary.
+// Labeling happens per-conversation in parallel, producing fragmented vocabulary.
+// The theme step consolidates labels into canonical themes when the vocabulary
+// exceeds the threshold. Grouping is by exact label match after theming.
 func RunClustered(
 	ctx context.Context,
 	store storage.Store,
@@ -127,25 +134,35 @@ func RunClustered(
 	}
 	logAfter("%d labels%s", numLabels, labelNote).Cost(time.Since(labelStart), labelUsage.Cost()).Print()
 
-	// ── NORMALIZE ──────────────────────────────────────────────────────
-	normalizeStart := time.Now()
-	logBefore("normalize", "%d labels", numLabels)
-	normalizeUsage, err := runNormalize(ctx, store, labelLLM, opts.Verbose)
-	if err != nil {
-		return nil, fmt.Errorf("normalize: %w", err)
+	// ── THEME (when label set is fragmented) ──────────────────────────────
+	var themeMapping map[string]string
+	if numLabels > themeThreshold {
+		themeStart := time.Now()
+		logBefore("theme", "%d labels", numLabels)
+		var themeUsage inference.Usage
+		themeMapping, themeUsage, err = runTheme(ctx, store, labelLLM, opts.Verbose)
+		if err != nil {
+			return nil, fmt.Errorf("theme: %w", err)
+		}
+		totalUsage = totalUsage.Add(themeUsage)
+		stages = append(stages, StageStats{
+			Name:     "theme",
+			Model:    labelLLM.Model(),
+			Duration: time.Since(themeStart),
+			Usage:    themeUsage,
+		})
+		themeAfter := logAfter("themed")
+		if themeUsage.InputTokens == 0 {
+			themeAfter.Tail = "(cached)"
+		} else {
+			themeAfter.Cost(time.Since(themeStart), themeUsage.Cost())
+		}
+		themeAfter.Print()
 	}
-	totalUsage = totalUsage.Add(normalizeUsage)
-	stages = append(stages, StageStats{
-		Name:     "normalize",
-		Model:    labelLLM.Model(),
-		Duration: time.Since(normalizeStart),
-		Usage:    normalizeUsage,
-	})
-	logAfter("normalized").Cost(time.Since(normalizeStart), normalizeUsage.Cost()).Print()
 
 	// ── GROUP ───────────────────────────────────────────────────────────
 	groupStart := time.Now()
-	clusters, noiseObs, err := runGroup(ctx, store, allObs)
+	clusters, noiseObs, err := runGroup(ctx, store, allObs, themeMapping)
 	if err != nil {
 		return nil, fmt.Errorf("group: %w", err)
 	}
@@ -206,6 +223,32 @@ func RunClustered(
 	})
 	logAfter("%d summaries", len(summaries)).Cost(time.Since(synthStart), synthUsage.Cost()).Print()
 
+	// ── THESIS ─────────────────────────────────────────────────────────
+	thesisStart := time.Now()
+	logBefore("thesis", "%d summaries", len(summaries))
+	thesis, thesisUsage, err := runThesis(ctx, composeLLM, summaries)
+	if err != nil {
+		return nil, fmt.Errorf("thesis: %w", err)
+	}
+	totalUsage = totalUsage.Add(thesisUsage)
+	thesisDataSize := 0
+	for _, s := range summaries {
+		thesisDataSize += len(s)
+	}
+	stages = append(stages, StageStats{
+		Name:     "thesis",
+		Model:    composeLLM.Model(),
+		Duration: time.Since(thesisStart),
+		Usage:    thesisUsage,
+		DataSize: thesisDataSize,
+	})
+	logAfter("thesis").Cost(time.Since(thesisStart), thesisUsage.Cost()).Print()
+
+	// Validate that the thesis references every cluster from the input.
+	if err := ValidateThesis(thesis, len(summaries)); err != nil {
+		return nil, err
+	}
+
 	// ── COMPOSE ────────────────────────────────────────────────────────
 	composeStart := time.Now()
 	composeInput := fmt.Sprintf("%d summaries", len(summaries))
@@ -213,7 +256,7 @@ func RunClustered(
 		composeInput += fmt.Sprintf(" + %d outliers", len(noiseObs))
 	}
 	logBefore("compose", "%s", composeInput)
-	muse, _, composeUsage, err := runCompose(ctx, composeLLM, store, summaries, noiseObs)
+	muse, _, composeUsage, err := runCompose(ctx, composeLLM, store, thesis, summaries, noiseObs)
 	if err != nil {
 		return nil, fmt.Errorf("compose: %w", err)
 	}
@@ -288,6 +331,9 @@ func runObserve(
 	opts ClusteredOptions,
 	counter *atomic.Int32,
 ) (*observeResult, error) {
+	// Preload source metadata for import sources so isHumanSource can resolve them
+	humanOverrides := loadHumanSources(ctx, store)
+
 	entries, err := store.ListConversations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
@@ -295,23 +341,11 @@ func runObserve(
 
 	// Handle reobserve
 	if opts.Reobserve {
-		if len(opts.Sources) > 0 {
-			for _, src := range opts.Sources {
-				DeleteObservationsForSource(ctx, store, src)
-				if opts.Verbose {
-					fmt.Fprintf(os.Stderr, "  Cleared observations for %s\n", src)
-				}
-			}
-		} else {
-			DeleteObservations(ctx, store)
-			fmt.Fprintln(os.Stderr, "  Cleared all observations")
-		}
+		DeleteObservations(ctx, store)
+		fmt.Fprintln(os.Stderr, "  Cleared all observations")
 	}
 
-	// Filter by sources
-	entries = storage.FilterEntriesBySource(entries, opts.Sources)
-
-	// Count per-source conversations
+	// List all conversations
 	sourceCounts := map[string]int{}
 	for _, e := range entries {
 		sourceCounts[e.Source]++
@@ -323,11 +357,13 @@ func runObserve(
 	sort.Strings(sources)
 	discovered := len(entries)
 
-	// Compute prompt chain hash for fingerprinting. The extract strategy is
-	// included when set so switching strategies invalidates the cache.
-	hashParts := []string{prompts.Extract, prompts.Refine}
+	// Compute prompt chain hash for fingerprinting. Always includes the default
+	// observe + refine prompts. When an extract strategy is selected, the extract
+	// prompt and strategy name are folded in so switching strategies invalidates
+	// the cache.
+	hashParts := []string{prompts.Observe, prompts.ObserveHuman, prompts.Refine}
 	if opts.Extract != "" {
-		hashParts = append(hashParts, opts.Extract)
+		hashParts = append(hashParts, prompts.Extract, opts.Extract)
 	}
 	promptHash := Fingerprint(hashParts...)
 
@@ -406,7 +442,7 @@ func runObserve(
 				convBytes := conversationDataSize(conv)
 
 				start := time.Now()
-				items, u, err := extractObservations(ctx, llm, conv, opts.Verbose, opts.Extract)
+				items, u, err := observeAndParse(ctx, llm, conv, opts.Verbose, humanOverrides, opts.Extract)
 				n := counter.Add(1)
 				if err != nil {
 					return fmt.Errorf("observe %s: %w", entry.Key, err)
@@ -439,6 +475,10 @@ func runObserve(
 			return nil, err
 		}
 		prog.Stop()
+	} else if pruned > 0 {
+		// All conversations cached — print observe line so the user knows
+		// the stage ran and everything was a cache hit.
+		logBefore("observe", "%d conversations cached", pruned)
 	}
 
 	return &observeResult{
@@ -463,60 +503,90 @@ func conversationDataSize(conv *conversation.Conversation) int {
 	return n
 }
 
-// extractObservations runs the observe pipeline on a conversation and returns
+// observeAndParse runs the observe pipeline on a conversation and returns
 // discrete observations (not a markdown blob).
 //
-// Raw conversation is sent to the extract prompt by default. When the raw text
+// Conversation is sent to the observe prompt by default. When the raw text
 // exceeds the context window, mechanical compression is applied as a fallback:
 // code blocks are stripped, tool output is collapsed to [tool: name] markers,
 // and long assistant messages are truncated.
-func extractObservations(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, strategy string) ([]Observation, inference.Usage, error) {
+// observeAndParse runs the configured observation strategy and returns discrete
+// observations. The default strategy uses the standard observe+refine+parse
+// pipeline. Setting strategy="woo" or "adaptive" routes to the windowed
+// extraction paths added in paper-features.
+func observeAndParse(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, humanOverrides map[string]bool, strategy string) ([]Observation, inference.Usage, error) {
 	switch strategy {
 	case "woo":
-		return extractWoo(ctx, client, conv, verbose)
+		return extractWoo(ctx, client, conv, verbose, humanOverrides)
 	case "adaptive":
-		return extractAdaptive(ctx, client, conv, verbose)
+		return extractAdaptive(ctx, client, conv, verbose, humanOverrides)
 	}
-	return extractDefault(ctx, client, conv, verbose)
-}
-
-func extractDefault(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
-	refined, usage, err := extractAndRefine(ctx, client, conv, verbose)
+	refined, usage, err := observeAndRefine(ctx, client, conv, verbose, humanOverrides)
 	if err != nil {
 		return nil, usage, err
 	}
 	if refined == "" {
 		return nil, usage, nil
 	}
-	return filterObservations(refined, verbose), usage, nil
+
+	// Parse refined output into discrete items.
+	items := parseObservationItems(refined)
+
+	// Filter irrelevant items: empty responses, LLM meta-commentary, placeholder tokens
+	var relevant []Observation
+	var irrelevant []Observation
+	for _, item := range items {
+		if isRelevant(item.Text) {
+			relevant = append(relevant, item)
+		} else {
+			irrelevant = append(irrelevant, item)
+		}
+	}
+	if len(irrelevant) > 0 && verbose {
+		fmt.Fprintf(os.Stderr, "    filtered %d irrelevant observations:\n", len(irrelevant))
+		for _, item := range irrelevant {
+			text := item.Text
+			if len(text) > 100 {
+				text = text[:100] + "..."
+			}
+			fmt.Fprintf(os.Stderr, "      - %s\n", text)
+		}
+	}
+	return relevant, usage, nil
 }
 
-// extractAndRefine is the shared core of the observation pipeline. It extracts
-// turns from a conversation, mechanically compresses them, runs the extract
+// observeAndRefine is the shared core of the observation pipeline. It extracts
+// turns from a conversation, mechanically compresses them, runs the observe
 // prompt in chunks, and refines the candidates into a single text.
 // Both the map-reduce path (which wants raw text) and the clustering path
 // (which further parses into discrete items) call this function.
-func extractAndRefine(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) (string, inference.Usage, error) {
-	turns := extractTurns(conv)
+func observeAndRefine(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, humanOverrides map[string]bool) (string, inference.Usage, error) {
+	turns := extractTurns(conv, humanOverrides)
 	if len(turns) == 0 {
 		return "", inference.Usage{}, nil
 	}
 
-	chunks := compressConversation(turns)
+	chunks := compressConversation(turns, conv.Source, humanOverrides)
 	if len(chunks) == 0 {
 		return "", inference.Usage{}, nil
 	}
 
+	// Select the appropriate observe prompt based on source type
+	observePrompt := prompts.Observe
+	if isHumanSource(conv.Source, humanOverrides) {
+		observePrompt = prompts.ObserveHuman
+	}
+
 	var totalUsage inference.Usage
 
-	// Extract candidates (Pass 1)
+	// Observe (Pass 1)
 	var allCandidates []string
 	for i, chunk := range chunks {
 		start := time.Now()
-		obs, usage, err := inference.Converse(ctx, client, prompts.Extract, chunk, inference.WithMaxTokens(4096))
+		obs, usage, err := inference.Converse(ctx, client, observePrompt, chunk, inference.WithMaxTokens(4096))
 		totalUsage = totalUsage.Add(usage)
 		if verbose {
-			fmt.Fprintf(os.Stderr, "      extract[%d/%d] %d chars → %d chars (%s, $%.4f)\n",
+			fmt.Fprintf(os.Stderr, "      observe[%d/%d] %d chars → %d chars (%s, $%.4f)\n",
 				i+1, len(chunks), len(chunk), len(obs), time.Since(start).Round(time.Millisecond), usage.Cost())
 		}
 		if err != nil && obs == "" {
@@ -585,8 +655,8 @@ const (
 // across the conversation, strips assistant text from each window, and extracts
 // from each window independently. Deduplicates across overlapping windows, then
 // refines.
-func extractWoo(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
-	turns := extractTurns(conv)
+func extractWoo(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, humanOverrides map[string]bool) ([]Observation, inference.Usage, error) {
+	turns := extractTurns(conv, humanOverrides)
 	if len(turns) == 0 {
 		return nil, inference.Usage{}, nil
 	}
@@ -640,8 +710,8 @@ func extractWoo(ctx context.Context, client inference.Client, conv *conversation
 // extractAdaptive tries woo (owner-only) first on each window. If woo returns
 // NONE, it falls back to the default method (with assistant text) on the same
 // window. At most two calls per window.
-func extractAdaptive(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool) ([]Observation, inference.Usage, error) {
-	turns := extractTurns(conv)
+func extractAdaptive(ctx context.Context, client inference.Client, conv *conversation.Conversation, verbose bool, humanOverrides map[string]bool) ([]Observation, inference.Usage, error) {
+	turns := extractTurns(conv, humanOverrides)
 	if len(turns) == 0 {
 		return nil, inference.Usage{}, nil
 	}
@@ -662,7 +732,7 @@ func extractAdaptive(ctx context.Context, client inference.Client, conv *convers
 		}
 		wooInput := wooB.String()
 
-		chunks := compressConversation(w)
+		chunks := compressConversation(w, conv.Source, humanOverrides)
 		defaultInput := strings.Join(chunks, "\n")
 
 		attempts := []struct {
@@ -794,20 +864,74 @@ func deduplicateObservationText(text string) string {
 // full assistant text.
 const maxAssistantChars = 500
 
-// compressConversation mechanically compresses turns for extraction: strips
+// isHumanSource returns true for sources where conversations are between
+// the owner and other people (not AI assistants). Built-in human sources are
+// hardcoded. Import sources are resolved via the humanSources override map,
+// which is loaded from source metadata at pipeline start.
+func isHumanSource(source string, overrides map[string]bool) bool {
+	switch source {
+	case "slack", "github-issues", "github-prs":
+		return true
+	default:
+		return overrides[source]
+	}
+}
+
+// loadHumanSources reads .muse-source.json metadata for all non-builtin sources
+// that have conversations in storage. Returns a map of source names that declared
+// type "human". Built-in sources are not included — isHumanSource handles those
+// via the hardcoded switch.
+func loadHumanSources(ctx context.Context, store storage.Store) map[string]bool {
+	overrides := make(map[string]bool)
+	builtin := conversation.BuiltinSourceNames()
+
+	entries, err := store.ListConversations(ctx)
+	if err != nil {
+		return overrides
+	}
+
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		if builtin[e.Source] || seen[e.Source] {
+			continue
+		}
+		seen[e.Source] = true
+
+		data, err := store.GetData(ctx, conversation.SourceMetadataKey(e.Source))
+		if err != nil {
+			continue
+		}
+		var meta conversation.SourceMetadata
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if meta.Type == "human" {
+			overrides[e.Source] = true
+		}
+	}
+	return overrides
+}
+
+// compressConversation mechanically compresses turns for observation: strips
 // code blocks, collapses tool output to [tool: name] markers, and truncates
-// long assistant messages. Returns chunked text ready for the extract prompt.
-func compressConversation(turns []turn) []string {
+// long assistant/peer messages. Returns chunked text ready for the observe prompt.
+func compressConversation(turns []turn, source string, humanOverrides map[string]bool) []string {
 	var chunks []string
 	var b strings.Builder
+
+	ownerLabel := "[owner]"
+	peerLabel := "[assistant]"
+	if isHumanSource(source, humanOverrides) {
+		peerLabel = "[peer]"
+	}
 
 	for _, t := range turns {
 		var entry string
 		if t.assistantContent != "" {
 			compressed := compressAssistant(t.assistantContent)
-			entry = fmt.Sprintf("[assistant]: %s\n[human]: %s\n\n", compressed, t.humanContent)
+			entry = fmt.Sprintf("%s: %s\n%s: %s\n\n", peerLabel, compressed, ownerLabel, t.humanContent)
 		} else {
-			entry = fmt.Sprintf("[human]: %s\n\n", t.humanContent)
+			entry = fmt.Sprintf("%s: %s\n\n", ownerLabel, t.humanContent)
 		}
 
 		if b.Len()+len(entry) > maxChunkChars && b.Len() > 0 {
@@ -945,7 +1069,8 @@ func isRelevant(s string) bool {
 // observationPrefix is the required prefix for structured observation output.
 const observationPrefix = "Observation: "
 
-// quotePrefix is the optional prefix for verbatim voice-carrying quotes.
+// quotePrefix is the optional prefix for verbatim quotes (voice signal from
+// human sources, reasoning anchors from AI sources).
 const quotePrefix = "Quote: "
 
 // parseObservationItems extracts discrete observations from LLM output.
@@ -1023,13 +1148,13 @@ type observationEntry struct {
 	Source         string
 	ConversationID string
 	Index          int
-	Quote          string // optional verbatim quote carrying voice signal
+	Quote          string // optional verbatim quote (voice from human sources, reasoning anchor from AI sources)
 	Text           string // the analytical observation text
 	Date           string // conversation date (YYYY-MM-DD)
 }
 
 // Format returns the observation as text for LLM consumption. When a quote
-// is present, it's included as a voice exemplar preceding the observation.
+// is present, it's included as an exemplar preceding the observation.
 // The date is included so downstream stages can reason about recency.
 func (e observationEntry) Format() string {
 	var parts []string
@@ -1311,7 +1436,7 @@ func runLabel(
 
 				prompt := buildLabelPrompt(labels.list())
 				input := buildLabelInput(batchTexts)
-				resp, u, err := inference.Converse(ctx, llm, prompt, input, inference.WithMaxTokens(1024))
+				resp, u, err := inference.Converse(ctx, llm, prompt, input, inference.WithMaxTokens(4096))
 				usage = usage.Add(u)
 				if err != nil {
 					return fmt.Errorf("label batch for %s/%s: %w", key.source, key.conversationID, err)
@@ -1358,28 +1483,40 @@ func runLabel(
 	return totalUsage, HitMiss{Hit: int(hits.Load()), Miss: int(misses.Load())}, len(labels.list()), nil
 }
 
-// ── NORMALIZE ───────────────────────────────────────────────────────────
+// ── THEME ─────────────────────────────────────────────────────────────
 
-// runNormalize merges synonymous labels via a single LLM call.
-// The mapping is cached by label vocabulary hash — it only reruns when
-// the set of labels changes.
-func runNormalize(
+// themeBatchSize is the number of labels per mapping batch in pass 2.
+// Sized for LLM reliability, not context window — models skip entries
+// in long enumeration tasks. 100 labels ≈ 1500 output tokens, well
+// within budget. Throughput scales via concurrency (SetLimit), not
+// batch size; providers handle backpressure via AIMD rate limiting.
+const themeBatchSize = 100
+
+// runTheme consolidates a fragmented label set into canonical themes.
+// This handles the cold-start case where parallel labeling produces hundreds of
+// unique labels because conversations are labeled without shared vocabulary.
+// The mapping is applied at group time (labels on disk stay pristine).
+//
+// Two passes:
+//  1. Identify 15-25 canonical themes (fixed output, scales with any input size)
+//  2. Map labels → themes in parallel batches (output bounded per batch)
+func runTheme(
 	ctx context.Context,
 	store storage.Store,
 	llm inference.Client,
 	verbose bool,
-) (inference.Usage, error) {
+) (map[string]string, inference.Usage, error) {
 	// Collect all unique labels
 	convList, err := ListLabels(ctx, store)
 	if err != nil {
-		return inference.Usage{}, fmt.Errorf("list labels: %w", err)
+		return nil, inference.Usage{}, fmt.Errorf("list labels: %w", err)
 	}
 
 	uniqueLabels := map[string]bool{}
 	for _, ss := range convList {
 		lbl, err := GetLabels(ctx, store, ss.Source, ss.ConversationID)
 		if err != nil {
-			return inference.Usage{}, fmt.Errorf("get labels %s/%s: %w", ss.Source, ss.ConversationID, err)
+			return nil, inference.Usage{}, fmt.Errorf("get labels %s/%s: %w", ss.Source, ss.ConversationID, err)
 		}
 		for _, item := range lbl.Items {
 			if item.Label != "" {
@@ -1388,71 +1525,163 @@ func runNormalize(
 		}
 	}
 
-	if len(uniqueLabels) == 0 {
-		return inference.Usage{}, nil
-	}
-
-	// Sort labels for deterministic fingerprinting
 	sorted := make([]string, 0, len(uniqueLabels))
 	for l := range uniqueLabels {
 		sorted = append(sorted, l)
 	}
 	sort.Strings(sorted)
 
-	fp := Fingerprint(append(sorted, Fingerprint(prompts.Normalize))...)
+	fp := Fingerprint(append(sorted, Fingerprint(prompts.ThemeIdentify), Fingerprint(prompts.ThemeMap))...)
 
 	// Check cache
-	existing, err := GetNormalization(ctx, store)
+	existing, err := GetThemes(ctx, store)
 	if err == nil && existing.Fingerprint == fp {
-		// Cache hit — still need to apply mapping to ensure consistency
-		if len(existing.Mapping) > 0 {
-			applyNormalization(ctx, store, convList, existing.Mapping)
-		}
-		return inference.Usage{}, nil
+		return existing.Mapping, inference.Usage{}, nil
 	}
 
-	// Build input: one label per line
-	var input strings.Builder
+	// Build label list for pass 1 input
+	var labelList strings.Builder
 	for _, l := range sorted {
-		input.WriteString("- ")
-		input.WriteString(l)
-		input.WriteString("\n")
+		labelList.WriteString("- ")
+		labelList.WriteString(l)
+		labelList.WriteString("\n")
 	}
 
-	resp, usage, err := inference.Converse(ctx, llm, prompts.Normalize, input.String(), inference.WithMaxTokens(4096))
+	// ── Pass 1: identify canonical themes (fixed output) ──────────────
+	resp, usage, err := inference.Converse(ctx, llm, prompts.ThemeIdentify, labelList.String(), inference.WithMaxTokens(4096))
 	if err != nil {
-		return usage, fmt.Errorf("normalize: %w", err)
+		return nil, usage, fmt.Errorf("theme identify: %w", err)
 	}
 
-	// Parse "original → canonical" lines
-	mapping := parseNormalizationResponse(resp)
+	themes := parseThemeLines(resp)
+	if len(themes) == 0 {
+		return nil, usage, fmt.Errorf("theme identify: no themes found in response")
+	}
 
-	if verbose && len(mapping) > 0 {
-		fmt.Fprintf(os.Stderr, "  Normalized %d labels:\n", len(mapping))
-		for from, to := range mapping {
-			fmt.Fprintf(os.Stderr, "    %s → %s\n", from, to)
+	// ── Pass 2: map labels → themes in parallel batches ───────────────
+	// Retry unmapped labels until full coverage or no progress.
+	themeList := strings.Join(themes, "\n")
+	mapping := map[string]string{}
+	var totalUsage inference.Usage
+	unmapped := sorted
+
+	for round := 1; len(unmapped) > 0; round++ {
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(50)
+
+		for i := 0; i < len(unmapped); i += themeBatchSize {
+			end := i + themeBatchSize
+			if end > len(unmapped) {
+				end = len(unmapped)
+			}
+			batch := unmapped[i:end]
+
+			g.Go(func() error {
+				var input strings.Builder
+				input.WriteString("THEMES:\n")
+				input.WriteString(themeList)
+				input.WriteString("\n\nLABELS:\n")
+				for _, l := range batch {
+					input.WriteString("- ")
+					input.WriteString(l)
+					input.WriteString("\n")
+				}
+
+				resp, u, err := inference.Converse(gctx, llm, prompts.ThemeMap, input.String(), inference.WithMaxTokens(4096))
+				mu.Lock()
+				totalUsage = totalUsage.Add(u)
+				mu.Unlock()
+				if err != nil && !inference.IsTruncated(err) {
+					return fmt.Errorf("theme map batch: %w", err)
+				}
+
+				batchMapping := parseThemeMappings(resp, batch)
+				mu.Lock()
+				for k, v := range batchMapping {
+					mapping[k] = v
+				}
+				mu.Unlock()
+				return nil
+			})
 		}
+		if err := g.Wait(); err != nil {
+			return nil, totalUsage.Add(usage), fmt.Errorf("theme: %w", err)
+		}
+
+		// Collect labels still missing a mapping (keys are lowercased)
+		var remaining []string
+		for _, l := range unmapped {
+			if _, ok := mapping[strings.ToLower(l)]; !ok {
+				remaining = append(remaining, l)
+			}
+		}
+		if verbose && len(remaining) > 0 {
+			fmt.Fprintf(os.Stderr, "  round %d: mapped %d/%d labels (%d remaining)\n",
+				round, len(unmapped)-len(remaining), len(unmapped), len(remaining))
+		}
+		if len(remaining) == len(unmapped) {
+			// No progress — map remaining labels to themselves as standalone themes.
+			// These will typically form tiny clusters that fall below the cluster
+			// threshold and end up as noise, which is the correct outcome for labels
+			// that don't fit any canonical theme.
+			for _, l := range remaining {
+				mapping[strings.ToLower(l)] = l
+			}
+			if verbose {
+				fmt.Fprintf(os.Stderr, "  round %d: %d labels self-mapped (no theme match)\n", round, len(remaining))
+			}
+			unmapped = nil
+			break
+		}
+		unmapped = remaining
+	}
+	totalUsage = totalUsage.Add(usage)
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "  %d themes, mapped %d/%d labels\n", len(themes), len(mapping), len(sorted))
 	}
 
-	// Save normalization mapping
-	norm := &Normalization{
+	// Save
+	result := &LabelMapping{
 		Fingerprint: fp,
 		Mapping:     mapping,
 	}
-	if err := PutNormalization(ctx, store, norm); err != nil {
-		return usage, fmt.Errorf("save normalization: %w", err)
+	if err := PutThemes(ctx, store, result); err != nil {
+		return nil, totalUsage, fmt.Errorf("save themes: %w", err)
 	}
 
-	// Apply mapping to label artifacts
-	if len(mapping) > 0 {
-		applyNormalization(ctx, store, convList, mapping)
-	}
-
-	return usage, nil
+	return mapping, totalUsage, nil
 }
 
-// parseNormalizationResponse parses "original → canonical" lines from the LLM response.
-func parseNormalizationResponse(resp string) map[string]string {
+// parseThemeLines extracts "THEME: <name>" lines from the pass 1 response.
+func parseThemeLines(resp string) []string {
+	var themes []string
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(line, "THEME: "); ok {
+			after = strings.TrimSpace(after)
+			if after != "" {
+				themes = append(themes, after)
+			}
+		}
+	}
+	return themes
+}
+
+// parseThemeMappings parses "original → canonical" lines from the pass 2 response.
+// inputLabels are the actual labels sent to the model; the parser resolves the
+// model's output against them case-insensitively since models often rephrase or
+// re-capitalize labels instead of copying them verbatim.
+//
+// Keys are lowercased to match runGroup's case-insensitive label lookup.
+func parseThemeMappings(resp string, inputLabels []string) map[string]string {
+	// Build case-insensitive lookup: lowered → original
+	lookup := make(map[string]string, len(inputLabels))
+	for _, l := range inputLabels {
+		lookup[strings.ToLower(l)] = l
+	}
+
 	mapping := map[string]string{}
 	for _, line := range strings.Split(resp, "\n") {
 		line = strings.TrimSpace(line)
@@ -1475,31 +1704,18 @@ func parseNormalizationResponse(resp string) map[string]string {
 		// Strip surrounding quotes
 		from = strings.Trim(from, "\"'")
 		to = strings.Trim(to, "\"'")
-		if from != "" && to != "" && from != to {
-			mapping[from] = to
-		}
-	}
-	return mapping
-}
-
-// applyNormalization rewrites label artifacts, replacing labels according to the mapping.
-func applyNormalization(ctx context.Context, store storage.Store, convList []SourceConversation, mapping map[string]string) {
-	for _, ss := range convList {
-		lbl, err := GetLabels(ctx, store, ss.Source, ss.ConversationID)
-		if err != nil {
+		if from == "" || to == "" {
 			continue
 		}
-		changed := false
-		for i, item := range lbl.Items {
-			if canonical, ok := mapping[item.Label]; ok {
-				lbl.Items[i].Label = canonical
-				changed = true
-			}
+		// Resolve against input labels case-insensitively
+		if original, ok := lookup[strings.ToLower(from)]; ok {
+			from = original
 		}
-		if changed {
-			PutLabels(ctx, store, ss.Source, ss.ConversationID, lbl)
-		}
+		// Lowercase key to match runGroup's case-insensitive lookup
+		key := strings.ToLower(from)
+		mapping[key] = to
 	}
+	return mapping
 }
 
 // ── GROUP ───────────────────────────────────────────────────────────────
@@ -1509,9 +1725,10 @@ type clusterResult struct {
 	ObservationIdxs []int // indices into the flat allObs slice
 }
 
-// runGroup groups observations by exact label match.
+// runGroup groups observations by exact label match, applying normalization at read time.
+// Labels on disk stay pristine; the normalization mapping is applied in-memory only.
 // Labels with minClusterSize+ observations form clusters; the rest is noise.
-func runGroup(ctx context.Context, store storage.Store, allObs []observationEntry) ([]clusterResult, []string, error) {
+func runGroup(ctx context.Context, store storage.Store, allObs []observationEntry, themeMapping map[string]string) ([]clusterResult, []string, error) {
 	// Load labels to get label for each observation
 	type conversationKey struct{ source, conversationID string }
 	lblByConversation := map[conversationKey]*Labels{}
@@ -1527,15 +1744,20 @@ func runGroup(ctx context.Context, store storage.Store, allObs []observationEntr
 		lblByConversation[conversationKey{ss.Source, ss.ConversationID}] = lbl
 	}
 
-	// Build observation → label mapping
+	// Build observation → label mapping, applying normalization at read time
 	obsLabels := make([]string, len(allObs))
 	for i, obs := range allObs {
 		key := conversationKey{obs.Source, obs.ConversationID}
 		lbl, ok := lblByConversation[key]
 		if ok && obs.Index < len(lbl.Items) {
-			obsLabels[i] = strings.ToLower(strings.TrimSpace(lbl.Items[obs.Index].Label))
+			label := strings.ToLower(strings.TrimSpace(lbl.Items[obs.Index].Label))
 			// Strip surrounding quotes from labels
-			obsLabels[i] = strings.Trim(obsLabels[i], "\"'")
+			label = strings.Trim(label, "\"'")
+			// Apply normalization mapping in-memory (labels stay pristine on disk)
+			if canonical, ok := themeMapping[label]; ok {
+				label = strings.ToLower(strings.TrimSpace(canonical))
+			}
+			obsLabels[i] = label
 		}
 	}
 
@@ -1697,18 +1919,56 @@ func runSummarize(
 	return summaries, totalUsage, nil
 }
 
+// ── THESIS ─────────────────────────────────────────────────────────────
+
+// ValidateThesis checks that the thesis output references every cluster
+// by its canonical "Cluster N" identifier. This ensures no cluster was
+// silently dropped before compose runs.
+func ValidateThesis(thesis string, clusterCount int) error {
+	for i := range clusterCount {
+		id := fmt.Sprintf("Cluster %d", i+1)
+		if !strings.Contains(thesis, id) {
+			return fmt.Errorf("thesis: missing %s — thesis output may have dropped a cluster", id)
+		}
+	}
+	return nil
+}
+
+// runThesis extracts identity, thesis, and section structure from cluster
+// summaries. This is a dedicated step so compose only has to write, not
+// discover structure and write simultaneously.
+func runThesis(
+	ctx context.Context,
+	llm inference.Client,
+	summaries []string,
+) (string, inference.Usage, error) {
+	var input strings.Builder
+	for i, summary := range summaries {
+		fmt.Fprintf(&input, "### Cluster %d\n\n%s\n\n", i+1, summary)
+	}
+
+	resp, usage, err := inference.Converse(ctx, llm, prompts.Thesis, input.String(), inference.WithMaxTokens(4096))
+	if err != nil {
+		return "", usage, err
+	}
+	return strings.TrimSpace(resp), usage, nil
+}
+
 // ── COMPOSE ────────────────────────────────────────────────────────────
 
-// runCompose combines cluster summaries and noise observations into muse.md.
+// runCompose combines thesis, cluster summaries, and noise observations into muse.md.
 func runCompose(
 	ctx context.Context,
 	llm inference.Client,
 	store storage.Store,
+	thesis string,
 	summaries []string,
 	noiseObs []string,
 ) (string, string, inference.Usage, error) {
 	var input strings.Builder
-	input.WriteString("## Cluster Summaries\n\n")
+	input.WriteString("## Thesis\n\n")
+	input.WriteString(thesis)
+	input.WriteString("\n\n## Cluster Summaries\n\n")
 	for i, summary := range summaries {
 		fmt.Fprintf(&input, "### Cluster %d\n\n%s\n\n", i+1, summary)
 	}
@@ -1728,8 +1988,8 @@ func runCompose(
 		}
 	}
 
-	stream := newStageStream(16000, 4096)
-	muse, usage, err := inference.ConverseStream(ctx, llm, prompts.ComposeClustered, input.String(), stream.callback(), inference.WithThinking(16000))
+	stream := newStageStream(inference.DefaultThinkingBudget, inference.DefaultMaxTokens)
+	muse, usage, err := inference.ConverseStream(ctx, llm, prompts.ComposeClustered, input.String(), stream.callback(), inference.WithThinking(inference.DefaultThinkingBudget))
 	stream.finish()
 	if err != nil {
 		return "", "", usage, err

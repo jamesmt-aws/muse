@@ -33,11 +33,15 @@ Add this to your agent's MCP config:
 				return err
 			}
 			document := loadDocument(ctx, store)
-			llm, err := newLLMClient(ctx, TierCompose)
+			llm, err := newLLMClient(ctx, TierStrong)
 			if err != nil {
 				return err
 			}
-			m := muse.New(llm, document)
+			dir, err := sessionsDir()
+			if err != nil {
+				return err
+			}
+			m := muse.New(llm, document, muse.WithSessionsDir(dir))
 			srv := mcpserver.NewServer(m)
 			return server.ServeStdio(srv)
 		},
