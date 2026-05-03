@@ -5,6 +5,9 @@ import _ "embed"
 //go:embed observe.md
 var Observe string
 
+//go:embed observe-windowed.md
+var ObserveWindowed string
+
 //go:embed refine.md
 var Refine string
 

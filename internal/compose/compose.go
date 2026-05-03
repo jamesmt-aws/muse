@@ -59,6 +59,10 @@ type BaseOptions struct {
 	Limit int
 	// Verbose enables per-item progress logging.
 	Verbose bool
+	// Extract selects the observation strategy: "" (default full-conversation),
+	// "woo" (windowed owner-only), "adaptive" (woo-first with fallback).
+	// See designs/011-long-conversation-pipeline.md.
+	Extract string
 }
 
 // Options configures a map-reduce compose run.

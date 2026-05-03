@@ -12,3 +12,5 @@ Distinguish three kinds of signal in the observations:
 - **Generative principles**: how the person reasons — the underlying logic that produces decisions. Distill to their most compressed form.
 - **Decision heuristics**: if/then rules that bridge a principle to a class of situations — "if X, then Y." When multiple observations show the same decision being made for the same structural reason in different contexts, the heuristic is the generalization. Preserve these — they are what makes the muse predictive rather than merely descriptive.
 - **Terminal rules**: specific decisions the principle has already made — standing operational rules like "reject X on principle," "Y by default, Z requires justification." Preserve at operational resolution, but only when the rule is genuinely distinctive. A preference for a specific tool, configuration, or routine practice is not a terminal rule — it's trivia. A terminal rule reveals a commitment that would predict other decisions.
+
+Summarize the pattern first, then include one or two verbatim quotes that illustrate the pattern in action. The summary tells the reader what the person does. The quotes show them doing it.
