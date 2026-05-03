@@ -21,6 +21,10 @@ Three stages run concurrently, connected by two channels:
 A conversation can be observed as soon as it is uploaded, without waiting for all sources to
 finish discovering. Label waits for all observations to complete.
 
+The default observe path sends the full compressed conversation in one pass. An alternative
+windowed pipeline is available for long conversations where the default washes out reasoning
+from early turns under later mechanical content. See `011-long-conversation-pipeline.md`.
+
 ## Compression
 
 The observe prompt asks for strong, specific observations anchored in concrete examples.
