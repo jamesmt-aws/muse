@@ -15,7 +15,8 @@ const DefaultMaxTokens = 4096
 // DefaultThinkingBudget is the standard extended thinking budget used across
 // compose and ask. Providers map this to their native mechanism (Anthropic
 // extended thinking, Bedrock thinking config, OpenAI reasoning effort).
-const DefaultThinkingBudget = 16000
+// See designs/013-inference-layer.md for the contract.
+const DefaultThinkingBudget = 16384
 
 // Apply returns the merged options.
 func Apply(opts []ConverseOption) ConverseOptions {

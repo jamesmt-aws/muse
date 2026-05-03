@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/spf13/cobra"
 
@@ -115,7 +116,21 @@ func newLLMClient(ctx context.Context, tier string) (inference.Client, error) {
 	case "anthropic":
 		return anthropic.NewClient(ctx, anthropicModel(tier))
 	case "openai":
-		return museOpenAI.NewClient(ctx, openaiModel(tier))
+		client, err := museOpenAI.NewClient(ctx, openaiModel(tier))
+		if err != nil {
+			return nil, err
+		}
+		if raw := os.Getenv("MUSE_OPENAI_THINKING_BUDGET"); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil {
+				return nil, fmt.Errorf("parse MUSE_OPENAI_THINKING_BUDGET: %w", err)
+			}
+			if n < 0 {
+				return nil, fmt.Errorf("MUSE_OPENAI_THINKING_BUDGET must be non-negative, got %d", n)
+			}
+			client.SetThinkingByDefault(int32(n))
+		}
+		return client, nil
 	case "bedrock":
 		return bedrock.NewClient(ctx, bedrockModel(tier))
 	default:

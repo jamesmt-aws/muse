@@ -66,10 +66,11 @@ const (
 // Rate limiting: applied via throttle.Retry around each API call, same pattern
 // as Anthropic — the SDK lacks typed status code errors.
 type Client struct {
-	client  openai.Client
-	model   string
-	pricing modelPricing
-	limiter throttle.Limiter
+	client            openai.Client
+	model             string
+	pricing           modelPricing
+	limiter           throttle.Limiter
+	thinkingByDefault int32 // tokens added to every call's MaxCompletionTokens; deployment-level
 }
 
 const (
@@ -77,6 +78,17 @@ const (
 	ModelMini      = "gpt-4.1-mini"
 	ModelReasoning = "o3"
 )
+
+// SetThinkingByDefault registers a per-call token allowance for deployments that
+// serve thinking-by-default models (e.g. Qwen3 Thinking via local llama.cpp).
+// The budget is added to MaxCompletionTokens on every request, on top of the
+// caller's WithMaxTokens and any WithThinking allocation. Default 0 (off) for
+// hosted deployments where models opt in to thinking via WithThinking.
+//
+// See designs/013-inference-layer.md for the contract.
+func (c *Client) SetThinkingByDefault(budget int32) {
+	c.thinkingByDefault = budget
+}
 
 // NewClient creates an OpenAI API client with adaptive rate limiting.
 // Reads OPENAI_API_KEY from env by default. model should be a concrete
@@ -195,6 +207,9 @@ func (c *Client) buildParams(system string, messages []inference.Message, opts i
 	if opts.ThinkingBudget > 0 && isReasoningModel(c.model) {
 		maxTokens += int64(opts.ThinkingBudget)
 	}
+	// Add deployment-level thinking budget for local thinking-by-default models.
+	// Composes additively with WithThinking; nonzero only when SetThinkingByDefault was called.
+	maxTokens += int64(c.thinkingByDefault)
 
 	msgs := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages)+1)
 	msgs = append(msgs, openai.SystemMessage(system))
