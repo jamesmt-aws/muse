@@ -76,6 +76,15 @@ muse compose --method=clustering
 muse compose --method=map-reduce
 ```
 
+The observation stage also accepts a strategy via `--observe-mode`, which controls how each
+conversation is presented to the observe prompt. Default is full-conversation observation.
+See `011-long-conversation-pipeline.md` for the windowed strategies.
+
+```bash
+muse compose --observe-mode woo         # windowed owner-only
+muse compose --observe-mode adaptive    # woo first, fallback per window
+```
+
 ### Caching
 
 Each cached artifact stores a fingerprint — a hash of its inputs. On read, if the fingerprint
@@ -95,7 +104,7 @@ human observe prompt invalidates all observations for re-observation.
 
 Fingerprints per layer:
 
-- **Observation**: `hash(conversation.LastModified, observePromptHash, observeHumanPromptHash, refinePromptHash)`
+- **Observation**: `hash(conversation.LastModified, observePromptHash, observeHumanPromptHash, refinePromptHash)` — when `--observe-mode` is set, the mode name is folded in (see `011-long-conversation-pipeline.md`, "Cache fingerprinting")
 - **Label**: `hash(observationContent, labelPromptHash)`
 - **Theme**: `hash(sorted unique labels, themePromptHash)`
 
