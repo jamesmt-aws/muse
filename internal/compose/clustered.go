@@ -1773,6 +1773,17 @@ func runCompose(
 const (
 	windowSize   = 8 // turns per window
 	windowStride = 4 // advance between windows
+
+	// windowObserveBudget is the initial max-tokens budget for a per-window
+	// observe call. Sized for non-thinking models; thinking models that exceed
+	// it are caught by retry-on-truncation.
+	windowObserveBudget = 4096
+
+	// windowObserveRetryBudget is the max-tokens budget used after truncation.
+	// Sized to absorb thinking from typical thinking-by-default models (Qwen3
+	// Thinking emits ~3-5k of reasoning per window). Windows that still
+	// truncate at this budget are skipped — no observation from that window.
+	windowObserveRetryBudget = 16384
 )
 
 // extractWoo runs windowed owner-only extraction. It slides an 8-turn window
@@ -1801,11 +1812,16 @@ func extractWoo(ctx context.Context, client inference.Client, conv *conversation
 		input := b.String()
 
 		start := time.Now()
-		obs, usage, err := inference.Converse(ctx, client, prompts.ObserveWindowed, input, inference.WithMaxTokens(4096))
+		obs, usage, err := observeWindow(ctx, client, input, verbose, i+1, len(windows), len(w))
 		totalUsage = totalUsage.Add(usage)
 		if verbose {
 			fmt.Fprintf(os.Stderr, "      window[%d/%d] %d turns, %d chars → %d chars (%s)\n",
 				i+1, len(windows), len(w), len(input), len(obs), time.Since(start).Round(time.Millisecond))
+		}
+		if inference.IsTruncated(err) {
+			// Pathological window: still truncated after retry. Skip rather
+			// than aborting the whole conversation.
+			continue
 		}
 		if err != nil && obs == "" {
 			return nil, totalUsage, err
@@ -1866,9 +1882,14 @@ func extractAdaptive(ctx context.Context, client inference.Client, conv *convers
 		}
 
 		start := time.Now()
+		truncated := false
 		for j, a := range attempts {
-			obs, usage, err := inference.Converse(ctx, client, prompts.ObserveWindowed, a.input, inference.WithMaxTokens(4096))
+			obs, usage, err := observeWindow(ctx, client, a.input, verbose, i+1, len(windows), len(w))
 			totalUsage = totalUsage.Add(usage)
+			if inference.IsTruncated(err) {
+				truncated = true
+				break
+			}
 			if err != nil && obs == "" {
 				return nil, totalUsage, err
 			}
@@ -1883,6 +1904,12 @@ func extractAdaptive(ctx context.Context, client inference.Client, conv *convers
 			if j == 0 && verbose {
 				fmt.Fprintf(os.Stderr, "      window[%d/%d] woo → NONE, trying default\n", i+1, len(windows))
 			}
+		}
+		if truncated {
+			// Pathological window: still truncated after retry on woo path. Skip.
+			// (The default-input path is reached only if woo returned NONE, not
+			// if it truncated; truncation aborts the per-window attempts loop.)
+			continue
 		}
 	}
 
@@ -2006,4 +2033,23 @@ func filterObservations(text string, verbose bool) []Observation {
 		}
 	}
 	return relevant
+}
+
+// observeWindow runs the windowed observe prompt against a single window's
+// input. If the call truncates (TruncatedError, typically because a
+// thinking-by-default model spent the whole budget reasoning), it retries
+// once at windowObserveRetryBudget. If the retry also truncates, the
+// TruncatedError is returned for the caller to skip this window.
+func observeWindow(ctx context.Context, client inference.Client, input string, verbose bool, idx, total, windowTurns int) (string, inference.Usage, error) {
+	obs, usage, err := inference.Converse(ctx, client, prompts.ObserveWindowed, input, inference.WithMaxTokens(windowObserveBudget))
+	if !inference.IsTruncated(err) {
+		return obs, usage, err
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "      window[%d/%d] truncated at %d tokens, retrying at %d (%d turns)\n",
+			idx, total, windowObserveBudget, windowObserveRetryBudget, windowTurns)
+	}
+	retryObs, retryUsage, retryErr := inference.Converse(ctx, client, prompts.ObserveWindowed, input, inference.WithMaxTokens(windowObserveRetryBudget))
+	usage = usage.Add(retryUsage)
+	return retryObs, usage, retryErr
 }

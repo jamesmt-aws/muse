@@ -1,8 +1,14 @@
 package compose
 
 import (
+	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/ellistarn/muse/internal/conversation"
+	"github.com/ellistarn/muse/internal/inference"
 )
 
 func TestBuildWindowsBelowSizeReturnsSingleWindow(t *testing.T) {
@@ -104,3 +110,119 @@ func TestDeduplicateObservationTextPreservesDistinct(t *testing.T) {
 		t.Fatalf("got %d observations, want %d (no overlap)\noutput:\n%s", got, want, out)
 	}
 }
+
+// scriptedLLM is a minimal inference.Client that returns a sequence of
+// (text, error) responses across calls. Used to script truncation behavior
+// in retry tests.
+type scriptedLLM struct {
+	mu        sync.Mutex
+	responses []scriptedResponse
+	calls     atomic.Int32
+}
+
+type scriptedResponse struct {
+	text string
+	err  error
+}
+
+func (m *scriptedLLM) ConverseMessages(_ context.Context, _ string, _ []inference.Message, _ ...inference.ConverseOption) (*inference.Response, error) {
+	idx := int(m.calls.Add(1)) - 1
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if idx >= len(m.responses) {
+		return &inference.Response{}, nil
+	}
+	r := m.responses[idx]
+	return &inference.Response{Text: r.text, Usage: inference.Usage{}}, r.err
+}
+
+func (m *scriptedLLM) ConverseMessagesStream(ctx context.Context, system string, messages []inference.Message, _ inference.StreamFunc, opts ...inference.ConverseOption) (*inference.Response, error) {
+	return m.ConverseMessages(ctx, system, messages, opts...)
+}
+
+func (m *scriptedLLM) Model() string { return "scripted" }
+
+// twoTurnConversation builds a minimal conversation with two user turns
+// (the minimum for AI sources to pass extractTurns) so extractWoo produces a
+// single window with one observe call (plus refine when observations exist).
+func twoTurnConversation() *conversation.Conversation {
+	return &conversation.Conversation{
+		Source: "test",
+		Messages: []conversation.Message{
+			{Role: "user", Content: "the owner says something distinctive"},
+			{Role: "assistant", Content: "ack"},
+			{Role: "user", Content: "and follows up with another distinctive thing"},
+			{Role: "assistant", Content: "ack"},
+		},
+	}
+}
+
+func TestExtractWooRetriesOnTruncation(t *testing.T) {
+	mock := &scriptedLLM{
+		responses: []scriptedResponse{
+			// per-window observe: truncates
+			{text: "", err: &inference.TruncatedError{OutputTokens: windowObserveBudget}},
+			// retry: succeeds
+			{text: "Observation: distinctive thinking pattern\n", err: nil},
+			// refine: succeeds
+			{text: "Observation: distinctive thinking pattern\n", err: nil},
+		},
+	}
+
+	obs, _, err := extractWoo(context.Background(), mock, twoTurnConversation(), false, nil)
+	if err != nil {
+		t.Fatalf("extractWoo: %v", err)
+	}
+	if got, want := mock.calls.Load(), int32(3); got != want {
+		t.Errorf("call count = %d, want %d (observe truncate, observe retry, refine)", got, want)
+	}
+	if len(obs) == 0 {
+		t.Errorf("expected observations after retry, got 0")
+	}
+}
+
+func TestExtractWooSkipsWindowOnPersistentTruncation(t *testing.T) {
+	mock := &scriptedLLM{
+		responses: []scriptedResponse{
+			// per-window observe: truncates
+			{text: "", err: &inference.TruncatedError{OutputTokens: windowObserveBudget}},
+			// retry: also truncates → window is skipped, no candidate, so no refine call
+			{text: "", err: &inference.TruncatedError{OutputTokens: windowObserveRetryBudget}},
+		},
+	}
+
+	obs, _, err := extractWoo(context.Background(), mock, twoTurnConversation(), false, nil)
+	if err != nil {
+		t.Fatalf("extractWoo returned error on skip-after-retry: %v", err)
+	}
+	if got, want := mock.calls.Load(), int32(2); got != want {
+		t.Errorf("call count = %d, want %d (observe + retry, no refine because no candidates)", got, want)
+	}
+	if len(obs) != 0 {
+		t.Errorf("expected no observations when window skipped, got %d", len(obs))
+	}
+}
+
+func TestExtractWooDoesNotRetryOnNonTruncationError(t *testing.T) {
+	otherErr := errExampleNonTruncation
+	mock := &scriptedLLM{
+		responses: []scriptedResponse{
+			{text: "", err: otherErr},
+		},
+	}
+
+	_, _, err := extractWoo(context.Background(), mock, twoTurnConversation(), false, nil)
+	if err == nil {
+		t.Fatal("expected non-truncation error to propagate, got nil")
+	}
+	if got, want := mock.calls.Load(), int32(1); got != want {
+		t.Errorf("call count = %d, want %d (no retry for non-truncation errors)", got, want)
+	}
+}
+
+// errExampleNonTruncation is a sentinel error distinct from inference.TruncatedError.
+var errExampleNonTruncation = &nonTruncationError{}
+
+type nonTruncationError struct{}
+
+func (e *nonTruncationError) Error() string { return "non-truncation network error" }
